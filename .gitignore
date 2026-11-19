@@ -8,3 +8,5 @@ dist/
 venv/
 .cvi-mcp/
 *.db
+setup-github.sh
+setup-mcp.sh
