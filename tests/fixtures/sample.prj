@@ -1,0 +1,24 @@
+[Project Header]
+Version = 1
+CVI Dir = "C:\Program Files\National Instruments\CVI2020"
+Project Type = 0
+
+[File 0001]
+Path = "main.c"
+
+[File 0002]
+Path = "comms.c"
+
+[File 0003]
+Path = "comms.h"
+
+[File 0004]
+Path = "ui_constants.h"
+
+[Compiler Options]
+Include Paths = ""
+Defines = ""
+
+[External Files]
+Path = "NiDAQmx.lib"
+Path2 = "visa32.lib"
