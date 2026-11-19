@@ -32,7 +32,7 @@ cvi-mcp --check
 
 `--check` prints what your machine actually offers: detected CVI installations
 whatever their year, SDK headers, build executable, active settings. It exits
-non-zero when something needs your attention.
+non-zero when something needs your attention !
 
 Then point it at a project and connect it to a client:
 
