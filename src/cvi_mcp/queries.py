@@ -140,12 +140,20 @@ class QueryEngine:
         self.db.close()
 
     def rel(self, path: str) -> str:
+        """Chemin relatif a la racine. Memorise: les outils l'appellent des
+        dizaines de milliers de fois pour quelques dizaines de fichiers, et
+        resolve() touche le disque a chaque fois."""
         if not self.root:
             return path
-        try:
-            return Path(os.path.relpath(Path(path).resolve(), self.root)).as_posix()
-        except ValueError:
-            return Path(path).as_posix()
+        cache = self.__dict__.setdefault("_rel_cache", {})
+        hit = cache.get(path)
+        if hit is None:
+            try:
+                hit = Path(os.path.relpath(Path(path).resolve(), self.root)).as_posix()
+            except ValueError:
+                hit = Path(path).as_posix()
+            cache[path] = hit
+        return hit
 
     # -------------------------------------------------------- vue d'ensemble --
 

@@ -225,6 +225,8 @@ def search_text(engine: QueryEngine, pattern: str, scope: str = "all", regex: bo
     strings ou all. Renvoie position, zone et fonction englobante, jamais
     la ligne de code: seulement le texte qui correspond (ou la chaine
     litterale entiere quand on cherche dans les chaines)."""
+    if not pattern or not pattern.strip():
+        return {"error": "motif vide: un motif vide correspondrait a chaque ligne"}
     flags = 0 if case else re.IGNORECASE
     try:
         compiled = re.compile(pattern if regex else re.escape(pattern), flags)
@@ -288,7 +290,8 @@ def find_by_topic(engine: QueryEngine, topic: str, limit: int = 10) -> dict:
         for word in words:
             if word in parts:
                 total += 3
-            elif any(p.startswith(word) or word.startswith(p) for p in parts if len(p) >= 3):
+            elif any(p.startswith(word) or (word.startswith(p) and len(p) >= max(3, 0.7 * len(word)))
+                     for p in parts if len(p) >= 3):
                 total += 2
             elif word in flat:
                 total += 1
@@ -395,16 +398,19 @@ def series(engine: QueryEngine, name: str | None = None, min_members: int = 3,
     generated = {r[0] for r in engine.db.execute("SELECT id FROM files WHERE origin != 'project'")}
     _panels, controls = _ui_constants(engine)
     wanted = None
+    stem = ""
     if name:
         key = _series_key(name.strip('"'))
         wanted = (key[0], key[2]) if key else None
+        stem = name.strip('"').rstrip("0123456789").lower()
     out = []
     for (prefix, suffix), members in families.items():
         if len(members) < min_members:
             continue
-        if wanted and (prefix.lstrip('"'), suffix) != wanted and not (
-            name and prefix.lstrip('"').lower().startswith(name.lower().rstrip("0123456789"))):
-            continue
+        if name and not (
+            (wanted and (prefix.lstrip('"'), suffix) == wanted)
+            or (stem and prefix.lstrip('"').lower().startswith(stem))):
+            continue   # un nom sans correspondance ne renvoie pas toutes les suites
         numbers = sorted(members)
         low, high = numbers[0], numbers[-1]
         if high - low + 1 > 2 * len(numbers):

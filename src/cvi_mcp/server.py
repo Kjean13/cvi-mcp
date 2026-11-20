@@ -29,7 +29,7 @@ from . import quality as qualitymod
 from . import risks as riskmod
 from . import threads as threadmod
 from .audit import AuditLog
-from .config import Config, named_projects, parse_define_list, set_active_project
+from .config import SETTINGS_FILE, Config, named_projects, parse_define_list, set_active_project
 from .indexer import Indexer
 from .prj import build_settings, collect_sources, discover_sources, parse_prj
 from .queries import LIBC, QueryEngine, page
@@ -194,15 +194,20 @@ def _engine(cfg: Config) -> QueryEngine:
     un fichier modifie est reindexe avant la reponse, rien a lancer a la main.
     Les chemins sortent relatifs a la racine commune du projet et de ses
     sources."""
-    proj = projectmod.load(cfg)
-    indexer = Indexer(cfg.db_path)
-    try:
-        report = indexer.index_files(proj.files, pp=proj.pp)
-        indexer.set_root(str(proj.root))
-    finally:
-        indexer.close()
-    _LAST["project"] = proj
-    _LAST["reindexed"] = report["indexed"]
+    proj = _cached_project(cfg)
+    if proj is None:
+        proj = projectmod.load(cfg)
+        indexer = Indexer(cfg.db_path)
+        try:
+            report = indexer.index_files(proj.files, pp=proj.pp)
+            indexer.set_root(str(proj.root))
+        finally:
+            indexer.close()
+        _LAST["project"] = proj
+        _LAST["reindexed"] = report["indexed"]
+        _LAST["stamp"] = _stamp(cfg, proj)
+    else:
+        _LAST["reindexed"] = 0
     engine = QueryEngine(cfg.db_path, proj.root)
     engine.project = proj
     return engine
@@ -210,6 +215,44 @@ def _engine(cfg: Config) -> QueryEngine:
 
 # Dernier projet assemble, pour les outils qui rejouent le preprocesseur.
 _LAST: dict = {}
+
+
+def _file_state(path: str | Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _stamp(cfg: Config, proj) -> tuple:
+    """Empreinte de tout ce qui peut changer le resultat de projectmod.load:
+    reglages, liste des sources du .prj et etat (date, taille) de chaque
+    fichier lu par le preprocesseur, SDK compris."""
+    settings = json.dumps(cfg.settings, sort_keys=True, default=str)
+    config_key = (
+        str(cfg.project_path), str(cfg.project_file), str(cfg.db_path),
+        tuple(cfg.exclude_patterns), tuple(sorted(cfg.extra_defines.items())),
+        cfg.build_config, cfg.index_unlisted, settings,
+    )
+    watched = {*proj.files, *getattr(proj.pp, "_cache", {}),
+               *(str(p) for p in cfg.project_files()),
+               os.environ.get("CVI_MCP_SETTINGS", "") or str(cfg.project_path / SETTINGS_FILE)}
+    return (config_key, tuple(proj.sources),
+            tuple(sorted((p, _file_state(p)) for p in watched)))
+
+
+def _cached_project(cfg: Config):
+    """Projet deja assemble si rien n'a bouge depuis, sinon None. Evite de
+    rejouer le preprocesseur sur tous les fichiers a chaque outil (2 s sur
+    un projet de 90 fichiers). L'index ne peut pas avoir change non plus:
+    seul ce serveur l'ecrit, et il manque alors son fichier."""
+    last, stamp = _LAST.get("project"), _LAST.get("stamp")
+    if last is None or stamp is None or cfg.index_unlisted or not cfg.db_path.exists():
+        return None
+    if _stamp(cfg, last) != stamp or tuple(_sources(cfg)) != tuple(last.sources):
+        return None
+    return last
 
 
 def _snippet(
@@ -472,6 +515,15 @@ def _why_empty(engine: QueryEngine, name: str | None = None, file: str | None = 
                          "#if: option de compilation desactivee")
         out["hint"] = f"macro_usages(name='{name}')"
         return out
+    defined = engine.db.execute(
+        "SELECT s.kind, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
+        "WHERE s.name = ? AND s.active = 1 LIMIT 1", (name,)
+    ).fetchone()
+    if defined:
+        out["reason"] = (f"'{name}' est defini ({defined[0]}, {engine.rel(defined[1])}) mais aucune "
+                         "reference n'a ete trouvee: probablement inutilise")
+        out["hint"] = "dead_code liste les symboles inutilises"
+        return out
     out["reason"] = f"aucun symbole indexe ne s'appelle '{name}'"
     suggestions = engine.suggest(name)
     if suggestions:
@@ -656,15 +708,24 @@ def find_usages(name: str, kind: str | None = None, limit: int = 200, file: str 
 
 @mcp.tool()
 def call_graph(
-    function: str,
+    function: str | None = None,
     direction: str = "callees",
     depth: int = 2,
     include_external: bool = False,
     include_inactive: bool = False,
+    name: str | None = None,
 ) -> str:
     """Graphe d'appels. direction: callees ou callers. include_external ajoute
     les appels hors projet (SDK, libc). Une arete via pointeur ou table de
-    pointeurs porte confidence: moyenne."""
+    pointeurs porte confidence: moyenne. name est un alias de function, comme
+    dans find_usages ou get_function."""
+    function = function or name
+    if not function:
+        return _reply("call_graph", {"direction": direction},
+                      {"error": "indiquer function (ou name): la fonction de depart"})
+    if direction not in ("callees", "callers"):
+        return _reply("call_graph", {"function": function, "direction": direction},
+                      {"error": f"direction inconnue: '{direction}'", "directions": ["callees", "callers"]})
     cfg = _cfg()
     engine = _engine(cfg)
     engine.include_inactive = include_inactive
@@ -703,6 +764,7 @@ def file_outline(file: str) -> str:
 def reindex(force: bool = False) -> str:
     """Reindexe le projet. force=true reconstruit tout l'index projet."""
     cfg = _cfg()
+    _LAST.pop("stamp", None)   # un reindex explicite ignore le cache de projet
     proj = projectmod.load(cfg)
     indexer = Indexer(cfg.db_path)
     try:
@@ -1254,6 +1316,9 @@ def call_sites(pattern: str, position: int | None = None) -> str:
     (Modbus*, *Wago*, Ini_Get*, MBT*): pour chaque position d'argument, les
     constantes utilisees (macros evaluees), leurs usages et les fonctions
     qui les passent. Retrouve adresses, registres et bits d'E/S."""
+    if not pattern or not pattern.strip():
+        return _reply("call_sites", {"pattern": pattern, "position": position},
+                      {"error": "motif vide: indiquer un nom ou un motif (Modbus*, Ini_Get*)"})
     cfg = _cfg()
     engine = _engine(cfg)
     try:
@@ -1270,6 +1335,9 @@ def persistence(kind: str = "ini", section: str | None = None, limit: int = 50,
     inifile), fonctions qui les lisent ou ecrivent, cles ecrites jamais
     relues et l'inverse; section filtre une section. kind=sql: tables et
     requetes ecrites en chaines litterales, par fonction."""
+    if kind not in ("ini", "sql"):
+        return _reply("persistence", {"kind": kind},
+                      {"error": f"kind inconnu: '{kind}'", "kinds": ["ini", "sql"]})
     cfg = _cfg()
     engine = _engine(cfg)
     try:

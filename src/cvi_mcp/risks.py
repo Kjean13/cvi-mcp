@@ -69,6 +69,8 @@ UNBOUNDED = {"strcpy": (0, 1), "strcat": (0, 1), "sprintf": (0, None), "vsprintf
              "gets": (0, None), "wcscpy": (0, 1), "lstrcpy": (0, 1)}
 
 _FORMAT_SPEC = re.compile(r"%(%|[-+ #0]*(\*|\d+)?(\.(\*|\d+))?(hh|h|ll|l|L|z|j|t|I64|I32)?[diouxXeEfgGaAcspn])")
+# Un echappement C vaut un caractere: \n, \033 (octal), \x1b (hexadecimal).
+_C_ESCAPE = re.compile(r"\\(?:[0-7]{1,3}|x[0-9a-fA-F]+|.)")
 _TYPE_SIZES = {"char": 1, "short": 2, "int": 4, "long": 4, "float": 4, "double": 8}
 
 
@@ -476,7 +478,9 @@ def _lock_walker(source, pairs, wrappers, blocking, returns) -> PathWalker:
             family, index, mode = wrappers[name]
             handle = _handle(args, index)
         elif name in blocking:
-            held = [k for k, (count, _r) in state.items() if count > 0]
+            # Le verrou s'affiche par son nom (giVerrou...), pas par la cle interne
+            # "<famille de liberation>(<verrou>)".
+            held = [_split_key(k)[1] for k, (count, _r) in state.items() if count > 0]
             if held:
                 walker.blocking.append({"call": name, "line": line, "locks_held": held})
             return
@@ -760,23 +764,33 @@ def _unbounded(name, args, local, where, line) -> list[dict]:
             return []  # litteral plus court que le tampon
     elif name in ("sprintf", "vsprintf") and len(args) > 1:
         bound = _format_bound(args[1], args[2:])
-        if bound is not None and bound < info["bytes"]:
-            return []  # format borne qui tient dans le tampon
+        if bound is not None and bound <= info["bytes"]:
+            return []  # format borne qui tient dans le tampon (NUL compris dans bound)
         floats = bool(re.search(r"%[^%a-zA-Z]*l?[fFeEgG]", args[1]))
         confidence = "faible" if bound is None else ("moyenne" if floats else "haute")
+        nominal = _format_bound(args[1], args[2:], nominal=True)
+        if bound is not None and nominal is not None and nominal <= info["bytes"]:
+            # Ne deborde que si un entier depasse la largeur prevue par le format
+            # (date, heure): possible en theorie seulement.
+            return [{**where, "check": "unbounded_copy", "line": line, "call": name,
+                     "buffer": dest, "buffer_bytes": info["bytes"], "confidence": "faible",
+                     "why": f"{name} dans {dest}[{info.get('size_text')}]: tient avec les largeurs "
+                            "du format, deborde seulement si un entier est plus large"}]
     return [{**where, "check": "unbounded_copy", "line": line, "call": name, "buffer": dest,
              "buffer_bytes": info["bytes"], "confidence": confidence,
              "why": f"{name} ecrit dans {dest}[{info.get('size_text')}] sans borne: "
                     "debordement si la source est plus longue"}]
 
 
-def _format_bound(fmt: str, args: list[str]) -> int | None:
-    """Taille maximale produite par un format litteral, None si une chaine
-    %s sans precision rend la taille imprevisible."""
+def _format_bound(fmt: str, args: list[str], nominal: bool = False) -> int | None:
+    """Taille maximale produite par un format litteral, NUL final compris,
+    None si une chaine %s sans precision rend la taille imprevisible.
+    nominal=True: un entier avec largeur fixe (%02d, %04i) compte sa largeur,
+    pas l'etendue complete d'un int."""
     if not (fmt.startswith('"') and fmt.endswith('"')):
         return None
     body = fmt[1:-1]
-    total = len(re.sub(r"\\.", "x", _FORMAT_SPEC.sub("", body)))
+    total = len(_C_ESCAPE.sub("x", _FORMAT_SPEC.sub("", body)))
     index = 0
     for match in _FORMAT_SPEC.finditer(body):
         spec = match.group(0)
@@ -797,7 +811,17 @@ def _format_bound(fmt: str, args: list[str]) -> int | None:
         elif conv == "c":
             size = 1
         elif conv in "diouxX":
-            size = 21 if "l" in (match.group(5) or "") else 11
+            big = (match.group(5) or "") in ("l", "ll", "I64")
+            if conv in "di":
+                size = 21 if big else 11          # signe compris
+            elif conv == "u":
+                size = 20 if big else 10
+            elif conv in "xX":
+                size = 16 if big else 8
+            else:
+                size = 22 if big else 11
+            if nominal and width:
+                size = 0                          # la largeur du format fait foi
         elif conv in "eEgGaA":
             size = 24 + (precision or 0)
         elif conv == "f":

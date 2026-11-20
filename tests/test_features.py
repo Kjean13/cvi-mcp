@@ -91,7 +91,45 @@ def test_configuration_from_env(sample, monkeypatch):
     assert call(server.config_map)["is_64"] is True
 
 
-# ------------------------------------------------------------------ recherche --
+# ---------------------------------------------------------------- cache projet --
+
+def test_project_cache_reused_when_nothing_changed(sample):
+    call(server.find_symbol, name="Handler1")
+    first = server._LAST["project"]
+    call(server.find_symbol, name="Handler1")
+    assert server._LAST["project"] is first
+    assert call(server.find_symbol, name="Handler1")["index_info"].get("reindexed_this_call") in (0, None)
+
+
+def test_project_cache_sees_edited_file(sample):
+    assert call(server.find_symbol, name="BrandNewFunc", exact=True)["count"] == 0
+    first = server._LAST["project"]
+    main = sample["root"] / "Src" / "main.c"
+    main.write_text(main.read_text(encoding="utf-8") + "\nint BrandNewFunc(void) { return 1; }\n",
+                    encoding="utf-8")
+    assert call(server.find_symbol, name="BrandNewFunc", exact=True)["count"] == 1
+    assert server._LAST["project"] is not first
+
+
+def test_project_cache_sees_changed_defines(sample, monkeypatch):
+    call(server.config_map)
+    first = server._LAST["project"]
+    monkeypatch.setenv("CVI_MCP_DEFINES", "OPTION_B")
+    assert call(server.find_symbol, name="OnlyB", exact=True)["count"] == 1
+    assert server._LAST["project"] is not first
+
+
+def test_project_cache_sees_header_change(sample):
+    """Un en-tete modifie change le code actif: le cache doit s'en apercevoir."""
+    header = sample["root"] / "Inc" / "app.h"
+    before = call(server.find_symbol, name="HeaderAddedMacro", exact=True)["count"]
+    header.write_text(header.read_text(encoding="utf-8") + "\n#define HeaderAddedMacro 7\n",
+                      encoding="utf-8")
+    assert before == 0
+    assert call(server.find_symbol, name="HeaderAddedMacro", exact=True)["count"] == 1
+
+
+# ---------------------------------------------------------------- recherche --
 
 def test_tolerant_search_and_filters(sample):
     hits = call(server.find_symbol, name="count derived")
@@ -105,6 +143,17 @@ def test_tolerant_search_and_filters(sample):
     pattern = call(server.list_symbols, file="Inc/*.h", kind="macro", limit=100)
     assert pattern["total"] >= 5
     assert "aucun fichier" in call(server.list_symbols, file="Nope/")["reason"]
+
+
+def test_unused_symbol_is_explained(sample):
+    """Un symbole defini mais jamais reference ne doit pas etre presente comme inconnu."""
+    names = [s["name"] for s in call(server.list_symbols, kind="global", limit=200)["items"]]
+    unused = [n for n in names if call(server.find_usages, name=n)["total"] == 0]
+    if not unused:  # aucune globale inutilisee dans le projet d'exemple
+        pytest.skip("pas de symbole inutilise dans l'exemple")
+    reason = call(server.find_usages, name=unused[0])["reason"]
+    assert "defini" in reason and "aucun symbole indexe" not in reason
+    assert "aucun symbole indexe" in call(server.find_usages, name="NoSuchThing99")["reason"]
 
 
 def test_search_text_zones(sample):
@@ -130,6 +179,34 @@ def test_topic_series_related_impact(sample):
     steps = {s["step"] for s in impact["checklist"]["items"]}
     assert {"definition", "directive #if", "tableau dimensionne", "macro derivee"} <= steps
     assert impact["nature"] == "macro"
+
+
+def test_topic_does_not_match_short_prefix_of_word(sample):
+    """'coloration' ne doit pas remonter ChangeColorRealTime (couleur graphique)."""
+    main = sample["root"] / "Src" / "main.c"
+    main.write_text(main.read_text(encoding="utf-8")
+                    + "\nint ChangeColorRealTime(void) { return 0; }\n"
+                    + "int AfficheColoration(void) { return 0; }\n"
+                    + "int ColorationMoyenne(void) { return 0; }\n", encoding="utf-8")
+    names = {f["name"] for f in call(server.find_by_topic, topic="coloration")["functions"]}
+    assert {"AfficheColoration", "ColorationMoyenne"} <= names
+    assert "ChangeColorRealTime" not in names
+
+
+def test_series_name_filter_is_strict(sample):
+    """Un nom inconnu ne doit pas renvoyer toutes les suites."""
+    everything = _items(call(server.series), "families")
+    assert len(everything) >= 1
+    assert [f["series"] for f in _items(call(server.series, name="gLabel1"), "families")] == ["gLabel<n>"]
+    assert _items(call(server.series, name="gLabel"), "families")      # sans numero: prefixe
+    assert _items(call(server.series, name="ZZZnope"), "families") == []
+    assert _items(call(server.series, name="ZZZnope7"), "families") == []
+
+
+def test_persistence_rejects_unknown_kind(sample):
+    assert "error" in call(server.persistence, kind="bin")
+    assert "keys" in call(server.persistence, kind="ini")
+    assert "tables" in call(server.persistence, kind="sql")
 
 
 def test_function_summary_skeleton_and_peek(sample, monkeypatch):
@@ -182,7 +259,10 @@ def test_lock_wrappers_order_blocking_and_macro_return(sample):
     report = call(server.lock_check, limit=50)
     assert {w["function"] for w in report["wrappers"]} == {"Lock", "Unlock"}
     assert report["lock_order_inversions"]
-    assert report["blocking_calls_while_held"][0]["call"] == "MessagePopup"
+    blocked = report["blocking_calls_while_held"][0]
+    assert blocked["call"] == "MessagePopup"
+    # Le verrou s'affiche par son nom, pas par la cle interne "Famille(verrou)".
+    assert blocked["locks_held"] and all("(" not in name for name in blocked["locks_held"])
     findings = {(f["function"], f["kind"]) for f in report["findings"]["items"]}
     assert ("MacroReturn", "return_while_held") in findings
     assert not any(f[0] in ("UsesWrapper", "Split") for f in findings)
@@ -304,3 +384,59 @@ def test_build_helpers():
     after = {"diagnostics": [{"file": "b.c", "message": "n", "severity": "warning"}]}
     change = build.compare_builds(before, after)
     assert change["fixed"] == 1 and change["new"][0]["file"] == "b.c"
+
+
+# ------------------------------------------------------- tailles de formats --
+
+@pytest.mark.parametrize("fmt, args, expected", [
+    ('"%c%c%c%c"', ["a", "b", "c", "d"], 5),                 # 4 caracteres + NUL
+    ('"\\033bg%06X\\033fg%06X"', ["a", "b"], 23),             # 6 + 2 * 8 hex + NUL
+    ('"%d"', ["n"], 12),                                      # int signe: 11 + NUL
+    ('"%u"', ["n"], 11),
+    ('"%lld"', ["n"], 22),
+    ('"%s"', ["name"], None),                                 # taille imprevisible
+    ('"id=%s"', ['"abc"'], 7),
+])
+def test_format_bound_values(fmt, args, expected):
+    from cvi_mcp import risks
+    assert risks._format_bound(fmt, args) == expected
+
+
+def test_format_bound_nominal_uses_field_width():
+    from cvi_mcp import risks
+    fmt = '"%04i-%02i-%02i"'
+    assert risks._format_bound(fmt, ["a", "b", "c"]) == 3 * 11 + 2 + 1
+    assert risks._format_bound(fmt, ["a", "b", "c"], nominal=True) == 4 + 2 + 2 + 2 + 1
+
+
+def _unbounded_item(fmt, size, args=("x",)):
+    from cvi_mcp import risks
+    local = {"buf": {"array": True, "bytes": size, "size_text": str(size)}}
+    return risks._unbounded("sprintf", ["buf", fmt, *args], local, {"function": "f", "file": "a.c"}, 1)
+
+
+def test_unbounded_sprintf_exact_fit_is_not_reported():
+    assert _unbounded_item('"%c%c%c%c"', 5, ("a", "b", "c", "d")) == []        # 5 octets: tient pile
+    assert _unbounded_item('"\\033bg%06X\\033fg%06X"', 24, ("a", "b")) == []   # 23 <= 24
+
+
+def test_unbounded_sprintf_tiers():
+    real = _unbounded_item('"%d-%d-%d-%d"', 10, ("a", "b", "c", "d"))
+    assert real and real[0]["confidence"] == "haute"
+    theory = _unbounded_item('"%04i-%02i-%02i"', 12, ("a", "b", "c"))           # 11 nominal <= 12
+    assert theory and theory[0]["confidence"] == "faible"
+    assert _unbounded_item('"%04i-%02i-%02i"', 8, ("a", "b", "c"))[0]["confidence"] == "haute"
+
+
+def test_call_graph_accepts_name_alias_and_validates(sample):
+    by_function = call(server.call_graph, function="main")
+    by_name = call(server.call_graph, name="main")
+    assert by_name["graph"] == by_function["graph"] and by_function["graph"].get("main") is not None
+    assert "error" in call(server.call_graph)
+    assert "error" in call(server.call_graph, function="main", direction="sideways")
+
+
+def test_empty_patterns_are_rejected(sample):
+    assert "error" in call(server.search_text, pattern="")
+    assert "error" in call(server.search_text, pattern="   ")
+    assert "error" in call(server.call_sites, pattern="")
