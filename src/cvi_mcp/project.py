@@ -2,7 +2,7 @@
 #  cvi_mcp/project.py
 #  Role     Assemble un projet: sources, configuration de build, preprocesseur
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -27,6 +27,9 @@ class Project:
     unlisted: list[str] = field(default_factory=list)
     unreached: list[str] = field(default_factory=list)
     pp: Preprocessor | None = None
+    # Resultats d'analyses couteuses, valables tant que ce projet l'est (il est
+    # remplace des qu'un fichier ou un reglage change). Cle: nom de l'analyse.
+    memo: dict = field(default_factory=dict)
 
 
 def _inside(path: str, root: Path) -> bool:

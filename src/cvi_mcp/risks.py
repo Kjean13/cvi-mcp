@@ -3,7 +3,7 @@
 #  Role     Suivi chemin par chemin des verrous et ressources, risques C
 #           classiques. Positions et explications seulement, jamais de code.
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -14,6 +14,10 @@ from pathlib import Path
 from .cparse import declarator_info, neutralize, new_parser, read_source, text_of, walk
 from .preproc import evaluate_value
 from .queries import QueryEngine
+
+# Rang d'une confiance: plus petit = plus sur. Partage avec le serveur et avec
+# threads.py pour que le tri et le seuil min_confidence parlent la meme langue.
+CONFIDENCE_RANK = {"haute": 0, "moyenne": 1, "faible": 2}
 
 # Verrous: fonction de prise -> fonction de liberation. Le verrou est nomme
 # par sa fonction de liberation et son premier argument. CmtTryToGetLock est
@@ -351,23 +355,13 @@ def _handle(args: list[str], index: int) -> str:
 
 # ---------------------------------------------------------------- verrous -------
 
-def lock_check(engine: QueryEngine, pairs: dict[str, str] | None = None,
-               blocking: frozenset | None = None) -> dict:
-    """Verrous suivis chemin par chemin sur le code compile. Fonctions qui
-    prennent ou rendent un verrou recu en parametre reconnues comme
-    enveloppes; ordre de prise de plusieurs verrous (risque d'interblocage);
-    appels bloquants verrou tenu."""
-    pairs = {**LOCK_PAIRS, **(pairs or {})}
-    blocking = blocking or BLOCKING_CALLS
-    release = set(pairs.values())
-    returns = _return_macros(engine)
-    names = list(pairs) + list(release)
-    totals = {r["name"]: r["total"] for r in engine.db.execute(
-        f"SELECT name, COUNT(*) AS total FROM refs WHERE kind = 'call' AND active = 1 "
-        f"AND name IN ({','.join('?' for _ in names)}) GROUP BY name", names)}
+def _lock_wrappers(engine: QueryEngine, pairs: dict, blocking: frozenset, returns: set,
+                   names: list[str]) -> tuple[dict, dict]:
+    """Enveloppes de verrou et fichiers a suivre.
 
-    # Passe 1: enveloppes (une fonction qui prend le verrou passe en parametre
-    # et le garde, ou qui le rend sans l'avoir pris).
+    Une enveloppe est une fonction qui prend le verrou recu en parametre et le
+    garde, ou qui le rend sans l'avoir pris. Deux passes: une enveloppe peut
+    en appeler une autre. Renvoie (enveloppes, fichier -> fonctions a suivre)."""
     wrappers: dict[str, tuple[str, int, str]] = {}
     targets = _project_paths(engine, names)
     for _round in range(2):
@@ -383,6 +377,25 @@ def lock_check(engine: QueryEngine, pairs: dict[str, str] | None = None,
                         if finding["kind"] in ("held_at_end", "return_while_held", "release_without_acquire"):
                             wrappers[fname] = (family, params.index(handle), mode)
         targets = _project_paths(engine, names + list(wrappers))
+    return wrappers, targets
+
+
+
+def lock_check(engine: QueryEngine, pairs: dict[str, str] | None = None,
+               blocking: frozenset | None = None) -> dict:
+    """Verrous suivis chemin par chemin sur le code compile. Fonctions qui
+    prennent ou rendent un verrou recu en parametre reconnues comme
+    enveloppes; ordre de prise de plusieurs verrous (risque d'interblocage);
+    appels bloquants verrou tenu."""
+    pairs = {**LOCK_PAIRS, **(pairs or {})}
+    blocking = blocking or BLOCKING_CALLS
+    release = set(pairs.values())
+    returns = _return_macros(engine)
+    names = list(pairs) + list(release)
+    totals = {r["name"]: r["total"] for r in engine.db.execute(
+        f"SELECT name, COUNT(*) AS total FROM refs WHERE kind = 'call' AND active = 1 "
+        f"AND name IN ({','.join('?' for _ in names)}) GROUP BY name", names)}
+    wrappers, targets = _lock_wrappers(engine, pairs, blocking, returns, names)
 
     findings, partial, order_edges, blocked = [], [], {}, []
     checked = 0
@@ -462,7 +475,7 @@ def _split_key(key: str) -> tuple[str, str]:
     return family, handle.rstrip(")")
 
 
-def _lock_walker(source, pairs, wrappers, blocking, returns) -> PathWalker:
+def _lock_walker(source, pairs, wrappers, blocking, returns, walker_class=None) -> PathWalker:
     release = set(pairs.values())
 
     def track(call, state, walker: PathWalker) -> None:
@@ -503,7 +516,83 @@ def _lock_walker(source, pairs, wrappers, blocking, returns) -> PathWalker:
             else:
                 walker.findings.append({"kind": "release_without_acquire", "line": line, "key": key})
 
-    return PathWalker(source, track, returns)
+    return (walker_class or PathWalker)(source, track, returns)
+
+
+# ---------------------------------------------- verrous tenus, ligne par ligne -----
+
+class HeldLines:
+    """Verrous tenus a chaque position d'une fonction.
+
+    Une instruction occupe un intervalle (ligne, colonne): trois instructions
+    sur une meme ligne (CmtGetLock(l); x = 1; CmtReleaseLock(l);) ne se
+    confondent pas. Une instruction vue par plusieurs chemins garde
+    l'intersection: protegee seulement si elle l'est sur tous les chemins."""
+
+    def __init__(self) -> None:
+        self._by_line: dict[int, list[tuple[tuple[int, int], tuple[int, int], frozenset]]] = {}
+
+    def add(self, start: tuple[int, int], end: tuple[int, int], held: frozenset) -> None:
+        for line in range(start[0], end[0] + 1):
+            self._by_line.setdefault(line, []).append((start, end, held))
+
+    def at(self, line: int, col: int | None = None) -> frozenset:
+        """Verrous tenus en (ligne, colonne). Sans colonne, ceux qui le sont a
+        toutes les instructions de la ligne."""
+        spans = self._by_line.get(line, [])
+        if col is not None:
+            inside = [held for start, end, held in spans if start <= (line, col) <= end]
+            if inside:
+                return frozenset.intersection(*inside)
+        return frozenset.intersection(*(held for _s, _e, held in spans)) if spans else frozenset()
+
+
+class _HeldRecorder(PathWalker):
+    """Suit les verrous comme lock_check et note, pour chaque instruction, ceux
+    qui sont tenus apres elle. Les branches sont suivies chacune pour
+    elle-meme: apres un retour anticipe qui rend le verrou, la suite du code
+    reste sous verrou."""
+
+    def __init__(self, source, track, return_macros) -> None:
+        super().__init__(source, track, return_macros)
+        self.held = HeldLines()
+
+    def calls(self, node, state):
+        state = super().calls(node, state)
+        if node is not None and state is not None:
+            held = frozenset(_split_key(key)[1] for key, (count, _r) in state.items() if count > 0)
+            self.held.add((node.start_point[0] + 1, node.start_point[1]),
+                          (node.end_point[0] + 1, node.end_point[1]), held)
+        return state
+
+
+def lock_map(engine: QueryEngine, pairs: dict[str, str] | None = None) -> dict[str, HeldLines]:
+    """Pour chaque fonction qui touche a un verrou: les verrous tenus par position.
+
+    Une fonction absente n'en prend aucun. Deux fonctions static de meme nom
+    dans deux fichiers sont confondues (le nom seul identifie la fonction
+    dans l'index). Sert a threads.py pour dire si un acces est protege."""
+    # Reanalyser toutes les fonctions couteuses coute plusieurs secondes: avec les
+    # paires par defaut, le resultat est garde avec le projet (project.memo).
+    project = getattr(engine, "project", None)
+    memo = project.memo if project is not None and pairs is None else None
+    if memo is not None and "lock_map" in memo:
+        return memo["lock_map"]
+    pairs = {**LOCK_PAIRS, **(pairs or {})}
+    returns = _return_macros(engine)
+    names = list(pairs) + list(set(pairs.values()))
+    wrappers, targets = _lock_wrappers(engine, pairs, BLOCKING_CALLS, returns, names)
+    out: dict[str, HeldLines] = {}
+    for path, functions in targets.items():
+        for fname, node, source in function_nodes(engine, path, functions):
+            if fname in wrappers:
+                continue   # une enveloppe prend le verrou pour son appelant: pas de zone propre
+            walker = _lock_walker(source, pairs, wrappers, BLOCKING_CALLS, returns, _HeldRecorder)
+            walker.run(node.child_by_field_name("body"))
+            out[fname] = walker.held
+    if memo is not None:
+        memo["lock_map"] = out
+    return out
 
 
 LOCK_NOTES = {
@@ -724,6 +813,7 @@ def c_risks(engine: QueryEngine, checked_calls: frozenset | None = None) -> list
     testees, codes de retour ignores, formats printf incoherents."""
     checked_calls = checked_calls or CHECKED_CALLS
     env = engine.project.pp.env if getattr(engine, "project", None) else {}
+    char_globals = _char_globals(engine, env)
     names = sorted(set(UNBOUNDED) | set(FORMAT_ARG) | set(checked_calls))
     out: list[dict] = []
     for path, functions in _project_paths(engine, names).items():
@@ -737,7 +827,7 @@ def c_risks(engine: QueryEngine, checked_calls: frozenset | None = None) -> list
                 args = _args(call, source)
                 line = call.start_point[0] + 1
                 if name in UNBOUNDED and args:
-                    out.extend(_unbounded(name, args, local, where, line))
+                    out.extend(_unbounded(name, args, local, where, line, char_globals))
                 if name in FORMAT_ARG:
                     item = _format(name, args, where, line)
                     if item:
@@ -751,7 +841,10 @@ def c_risks(engine: QueryEngine, checked_calls: frozenset | None = None) -> list
     return out
 
 
-def _unbounded(name, args, local, where, line) -> list[dict]:
+def _unbounded(name, args, local, where, line, char_globals=None) -> list[dict]:
+    """Une copie sans borne vers un tableau local, ou rien quand on peut
+    prouver qu'elle tient: litteral court, format borne, ou (strcpy) source
+    qui est elle-meme un tableau char plus petit que le tampon."""
     dest_index, src_index = UNBOUNDED[name]
     dest = args[dest_index].lstrip("&").split("[")[0].strip()
     info = local.get(dest)
@@ -762,6 +855,12 @@ def _unbounded(name, args, local, where, line) -> list[dict]:
         source = args[src_index]
         if source.startswith('"') and len(source) - 2 < info["bytes"]:
             return []  # litteral plus court que le tampon
+        # strcpy ecrase le tampon: une source de taille connue <= au tampon tient
+        # toujours. strcat ajoute a un contenu inconnu: rien a prouver.
+        if name in ("strcpy", "lstrcpy"):
+            known = _source_bytes(source, local, char_globals or {})
+            if known is not None and known <= info["bytes"]:
+                return []
     elif name in ("sprintf", "vsprintf") and len(args) > 1:
         bound = _format_bound(args[1], args[2:])
         if bound is not None and bound <= info["bytes"]:
@@ -831,6 +930,82 @@ def _format_bound(fmt: str, args: list[str], nominal: bool = False) -> int | Non
         total += max(size, width)
         index += 1 + (match.group(2) == "*") + (match.group(4) == "*")
     return total + 1
+
+
+# ------------------------------------------------- tableaux de caracteres -------
+
+_DIMENSION = re.compile(r"\[([^\]]*)\]")
+
+
+def _char_globals(engine: QueryEngine, env: dict) -> dict[str, list[int]]:
+    """Globales char[] du projet: nom -> taille de chaque dimension (en octets,
+    un char vaut un octet). Sert a prouver qu'une copie tient dans son tampon.
+    Les tableaux de pointeurs et les dimensions non numeriques sont ignores."""
+    out: dict[str, list[int]] = {}
+    for row in engine.db.execute(
+        "SELECT s.name, s.signature FROM symbols s JOIN files f ON f.id = s.file_id "
+        "WHERE s.kind = 'global' AND s.active = 1 AND f.origin = 'project'"
+    ):
+        signature = row["signature"] or ""
+        head = signature.split("[", 1)[0]
+        if "[" not in signature or "char" not in head.split() or "*" in head:
+            continue
+        dims = [evaluate_value(d, env) for d in _DIMENSION.findall(signature)]
+        if dims and all(dims):
+            out[row["name"]] = dims
+    return out
+
+
+def _source_bytes(expr: str, local: dict, char_globals: dict) -> int | None:
+    """Taille garantie, NUL compris, de la chaine designee par expr: un tableau
+    char local, ou une globale char[] (avec ses indices: g[i] est la ligne i
+    d'un char g[N][M]). None quand on ne sait pas."""
+    match = re.fullmatch(r"([A-Za-z_]\w*)((?:\s*\[[^\]]*\])*)", expr.strip())
+    if not match:
+        return None
+    name, subscripts = match.groups()
+    used = subscripts.count("[")
+    info = local.get(name)
+    if info is not None:
+        # Un local masque la globale de meme nom. Ses dimensions multiples ne
+        # sont pas suivies: seul un tableau a une dimension, sans indice, compte.
+        return info["bytes"] if info.get("array") and info.get("bytes") and used == 0 else None
+    dims = char_globals.get(name)
+    return dims[-1] if dims and len(dims) - used == 1 else None
+
+
+# -------------------------------------------------------------- regroupement -----
+
+def group_findings(items: list[dict]) -> list[dict]:
+    """Une alerte par tampon et par fonction pour les copies non bornees.
+
+    Vingt strcat vers un meme tampon de requete SQL sont un seul probleme (la
+    somme peut deborder), pas vingt. Le groupe garde la meilleure confiance de
+    ses membres, la premiere ligne et la liste des lignes (douze au plus)."""
+    groups: dict[tuple, list[dict]] = {}
+    rest: list[dict] = []
+    for item in items:
+        if item["check"] != "unbounded_copy":
+            rest.append(item)
+        else:
+            groups.setdefault((item["file"], item["function"], item["buffer"]), []).append(item)
+    for members in groups.values():
+        if len(members) == 1:
+            rest.append(members[0])
+            continue
+        members.sort(key=lambda m: m["line"])
+        calls: dict[str, int] = {}
+        for member in members:
+            calls[member["call"]] = calls.get(member["call"], 0) + 1
+        best = min(members, key=lambda m: CONFIDENCE_RANK.get(m["confidence"], 2))
+        head = {**members[0], "confidence": best["confidence"], "occurrences": len(members),
+                "lines": [m["line"] for m in members][:12], "calls": calls}
+        detail = ", ".join(f"{call} x{count}" for call, count in calls.items())
+        head["why"] = (f"{len(members)} ecritures ({detail}) "
+                       f"dans {head['buffer']}[{head.get('buffer_bytes')}] sans borne: "
+                       "leur total peut depasser le tampon")
+        rest.append(head)
+    return rest
 
 
 def _format(name, args, where, line) -> dict | None:
@@ -919,7 +1094,8 @@ def _unchecked_alloc(body, source, local, where) -> list[dict]:
 
 
 RISK_NOTES = {
-    "unbounded_copy": "copie sans borne vers un tableau local de taille fixe",
+    "unbounded_copy": "copie sans borne vers un tableau local de taille fixe; les copies d'un meme "
+    "tampon dans une fonction sont regroupees (occurrences, lines), group=false pour les separer",
     "format_mismatch": "arguments en nombre different des conversions du format",
     "ignored_return": "code d'erreur d'une fonction qui peut echouer jamais lu",
     "unchecked_alloc": "allocation ou ouverture utilisee avant tout test d'echec",

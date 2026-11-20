@@ -19,11 +19,15 @@ Conventions communes:
   `offset`, `limit` et `next_offset` (`null` sur la derniere page).
 - **Budget de taille.** Aucune reponse ne depasse `CVI_MCP_MAX_CHARS` (40000
   par defaut): la plus grosse liste est coupee, `truncated` dit laquelle et
-  `next_offset` mene a la suite. `format="compact"` (ou
+  `next_offset` mene a la suite. Quand la liste coupee porte des elements avec
+  un `file`, `truncated` garde `by_file`, le compte par fichier de la liste
+  entiere: la vue d'ensemble survit a la coupe. `format="compact"` (ou
   `CVI_MCP_FORMAT=compact`) passe les listes en colonnes + lignes.
 - **Un vide s'explique.** Un resultat vide dit pourquoi: filtre de fichier
   inconnu, symbole present seulement dans du code exclu, nom seulement teste
-  par un `#if`, ou quelques `did_you_mean`.
+  par un `#if`, symbole defini mais jamais utilise, ou quelques `did_you_mean`
+  (jamais le nom cherche). Un motif vide dans `search_text` ou `call_sites`
+  est refuse.
 - **Confiance.** Les constats heuristiques portent `confidence`: `haute`,
   `moyenne` ou `faible`, avec la raison.
 - **Chemins** relatifs a la racine commune du projet et de ses sources.
@@ -53,7 +57,7 @@ Lire le projet
 | `find_symbol(name, exact, kind, include_inactive)` | sans casse; plusieurs mots doivent tous apparaitre (`turbine max`); abreviations usuelles (`nb` trouve `NOMBRE`) |
 | `get_function(name, include_body, lines, skeleton)` | signature, taille, complexite cyclomatique et cognitive, locales, pile estimee, appelants, appeles avec signature SDK, et `touches`: globales lues et ecrites, verrous, panneaux, controles, cles INI, SQL. `skeleton` donne la structure sans aucune expression. `lines`: `N` ou `a-b` |
 | `find_usages(name, kind, file, group_by, include_inactive, format)` | `call`, `read`, `write`, `ref`, plus `cond` (`#if`), `macro` (dans une autre macro), `dim` (taille de tableau), `decl` (initialiseur). `group_by`: `function` ou `file` |
-| `call_graph(function, direction, depth, include_external, include_inactive)` | appelants ou appeles; les aretes par pointeur ou table portent `confidence` |
+| `call_graph(function, direction, depth, include_external, include_inactive)` | appelants ou appeles; les aretes par pointeur ou table portent `confidence`. `name` est accepte pour `function`; une `direction` inconnue est une erreur |
 | `file_outline(file)` | un fichier: includes et leur resolution, symboles, encodage, `in_build`, garde, branches |
 
 Recherche et impact
@@ -64,7 +68,7 @@ Recherche et impact
 | `search_text(pattern, scope, regex, file, origin)` | recherche dans `code`, `comments` ou `strings`: position, zone, fonction englobante et seul le texte trouve |
 | `find_by_topic(topic)` | tout ce qui porte le nom d'un theme: fichiers, fonctions, callbacks, globales, macros, types, panneaux, controles, chaines |
 | `related(name)` | meme suite numerotee, utilises ensemble, meme fichier, noms proches |
-| `series(name, min_members)` | identifiants numerotes (`X1`..`Xn`): etendue, trous, fichiers qui s'arretent plus tot qu'ailleurs |
+| `series(name, min_members)` | identifiants numerotes (`X1`..`Xn`): etendue, trous, fichiers qui s'arretent plus tot qu'ailleurs, juges a part pour les definitions et les usages (`in`). Un `name` sans correspondance ne renvoie rien |
 | `impact(name)` | checklist pour modifier ou etendre un symbole: definitions, `#if`, tableaux, macros derivees, fonctions avec panneaux et cles INI, suites a prolonger |
 | `peek(file, line, before, after)` | quelques lignes autour d'une position; exige `CVI_MCP_ALLOW_PEEK=1`, plafonne, journalise |
 
@@ -96,11 +100,11 @@ Qualite et risques
 |---|---|
 | `dead_code(section)` | fonctions inatteignables depuis les points d'entree (`never_called`, `only_called_by_dead_code`, `only_used_in_excluded_code`), callbacks orphelines, globales inutilisees ou ecrites jamais lues, macros, panneaux (`never_loaded`, `only_in_excluded_code`, `indirect_load_possible` avec preuve) |
 | `lock_check(kind)` | verrous suivis chemin par chemin sur le code compile; fonctions enveloppes, inversions d'ordre de prise, appels bloquants verrou tenu |
-| `risks(check, file, min_confidence)` | `unbounded_copy`, `format_mismatch`, `ignored_return`, `unchecked_alloc`, `leak_on_return`, `leak_at_end`, `double_release`, `ui_from_thread`, `shared_global_unlocked` |
+| `risks(check, file, min_confidence, group)` | `unbounded_copy`, `format_mismatch`, `ignored_return`, `unchecked_alloc`, `leak_on_return`, `leak_at_end`, `double_release`, `ui_from_thread`, `shared_global_unlocked`, `inconsistent_lock`, `ui_control_unlocked`. `group` (vrai par defaut) regroupe les copies non bornees vers un meme tampon d'une meme fonction en une alerte (`occurrences`, `lines`, `calls`); `group=false` detaille chaque appel |
 | `consistency(check)` | `duplicate_definition`, `prototype_mismatch`, `declared_not_defined`, `could_be_static`, `extern_mismatch`, `callback_signature`, `control_on_wrong_panel` |
 | `complexity(sort, file, min_risk, section)` | lignes, cyclomatique, cognitive, imbrication, parametres, locales, pile; `section`: `by_file` ou `duplicates` (fonctions copiees d'un meme modele) |
 | `module_graph(file, format)` | dependances entre fichiers, cycles, paires mutuelles avec l'arete la plus legere a couper; `format`: `json`, `mermaid`, `dot` |
-| `threads(global_name)` | contextes d'execution (interface, pool de threads, timers asynchrones), ce que chacun atteint, timers d'interface, globales partagees; avec `global_name`, qui l'ecrit et la lit, d'ou, avec ou sans verrou |
+| `threads(global_name)` | contextes d'execution (interface, pool de threads, timers asynchrones), ce que chacun atteint, timers d'interface, globales partagees avec leurs acces non proteges (`unprotected_accesses`) et les verrous qui ne s'accordent pas (`conflicting_locks`); avec `global_name`, qui l'ecrit et la lit, d'ou, et les lignes ou aucun verrou n'est tenu |
 
 E/S industrielles et persistance
 -------------------------------------------------------------------------------
@@ -108,7 +112,7 @@ E/S industrielles et persistance
 | Outil | Ce qu'il donne |
 |---|---|
 | `call_sites(pattern, position)` | arguments constants passes a `Modbus*`, `*Wago*`, `MBT*`...: adresses, registres, bits, macros evaluees, fonctions appelantes |
-| `persistence(kind, section)` | `ini`: sections, cles, lecteurs et ecrivains, cles ecrites jamais relues et l'inverse. `sql`: tables et requetes par fonction |
+| `persistence(kind, section)` | `ini`: sections, cles, lecteurs et ecrivains, cles ecrites jamais relues et l'inverse. `sql`: tables et requetes par fonction. Tout autre `kind` est une erreur |
 
 SDK et build
 -------------------------------------------------------------------------------
@@ -126,4 +130,4 @@ Versions
 |---|---|
 | `snapshot_save(label)`, `snapshot_list()`, `snapshot_delete(label)` | etats nommes de l'index |
 | `diff_versions(before, after, path, files)` | `headline` en quelques phrases, puis ajouts, suppressions, deplacements, changements de signature, de valeur et de corps, symboles passes entre compile et exclu, constantes d'interface et cles INI ajoutees ou retirees, appels. Cotes: un instantane, `current` ou `path:<dossier>` (autre version ou variante). `files` restreint les deux cotes |
-| `history(target)` | historique git si le projet est un depot: commits sur les lignes d'une fonction, sur un fichier, ou les derniers |
+| `history(target)` | historique git si le projet est un depot: commits sur les lignes d'une fonction, sur un fichier, ou les derniers (15 fichiers au plus par commit, `files_total` donne le reste) |

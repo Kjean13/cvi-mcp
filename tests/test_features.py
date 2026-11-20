@@ -240,8 +240,15 @@ def test_c_risks_and_leaks(sample):
     assert ("unchecked_alloc", "Unchecked") in found and ("ignored_return", "Ignored") in found
     for clean in ("NoLeak", "Escapes", "Bitmap"):
         assert not any(i["function"] == clean for i in items), clean
+    # Par defaut les copies d'un meme tampon forment une alerte (le litteral court est sans danger).
     copies = [i for i in items if i["check"] == "unbounded_copy"]
-    assert len(copies) == 2  # le litteral court est sans danger
+    assert len(copies) == 1
+    assert copies[0]["occurrences"] == 2 and len(copies[0]["lines"]) == 2
+    assert set(copies[0]["calls"]) == {"strcpy", "sprintf"}
+    # group=false rend le detail, une alerte par appel.
+    _data, raw = _risks(file="risky.c", group=False)
+    detail = [i for i in raw if i["check"] == "unbounded_copy"]
+    assert len(detail) == 2 and not any("occurrences" in i for i in detail)
 
 
 def test_thread_risks(sample):
@@ -440,3 +447,281 @@ def test_empty_patterns_are_rejected(sample):
     assert "error" in call(server.search_text, pattern="")
     assert "error" in call(server.search_text, pattern="   ")
     assert "error" in call(server.call_sites, pattern="")
+
+
+# ------------------------------------------------ copies de taille prouvee --
+
+def _append_c(sample, text):
+    """Ajoute du code C a un fichier du projet d'exemple (le cache voit la modification)."""
+    main = sample["root"] / "Src" / "main.c"
+    main.write_text(main.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+
+def test_strcpy_from_smaller_array_is_proven_safe(sample):
+    _append_c(sample, """
+char gNames[4][16];
+char gTitle[40];
+static void CopySmall(int i)
+{
+    char dest[20];
+    char tiny[10];
+    strcpy(dest, gNames[i]);      /* 16 <= 20: tient */
+    strcpy(dest, tiny);           /* 10 <= 20: tient */
+    strcpy(tiny, gTitle);         /* 40 > 10: peut deborder */
+}
+""")
+    _data, items = _risks(file="main.c")
+    copies = [i for i in items if i["check"] == "unbounded_copy" and i["function"] == "CopySmall"]
+    assert [(c["buffer"], c["line"] - copies[0]["line"]) for c in copies] == [("tiny", 0)]
+
+
+def test_group_findings_keeps_best_confidence_and_lines():
+    from cvi_mcp import risks
+    base = {"check": "unbounded_copy", "function": "F", "file": "a.c", "buffer": "sql",
+            "buffer_bytes": 2000}
+    items = [{**base, "line": 30, "call": "strcat", "confidence": "moyenne"},
+             {**base, "line": 10, "call": "strcpy", "confidence": "haute"},
+             {**base, "line": 20, "call": "strcat", "confidence": "faible"},
+             {**base, "function": "G", "line": 5, "call": "strcat", "confidence": "moyenne"},
+             {"check": "ignored_return", "function": "F", "file": "a.c", "line": 1}]
+    grouped = risks.group_findings(items)
+    assert len(grouped) == 3          # F/sql groupe, G/sql seul, l'autre check
+    head = next(g for g in grouped if g.get("occurrences"))
+    assert (head["line"], head["lines"], head["confidence"]) == (10, [10, 20, 30], "haute")
+    assert head["calls"] == {"strcpy": 1, "strcat": 2}
+    assert not any("occurrences" in g for g in grouped if g["function"] == "G")
+
+
+# ------------------------------------------------ verrous suivis par ligne --
+
+LOCKED_C = """
+int gGuarded, gSplit, gOpen;
+int lockA, lockB, lockC;
+static void Bump(void)                   /* appelee seulement sous lockA */
+{
+    gGuarded++;
+    gSplit = 1;
+}
+static void Guarded(void)
+{
+    CmtGetLock(lockA);
+    Bump();
+    CmtReleaseLock(lockA);
+}
+static int Early(int err)                /* retour anticipe: la suite reste sous lockA */
+{
+    CmtGetLock(lockA);
+    if (err) {
+        CmtReleaseLock(lockA);
+        return -1;
+    }
+    gGuarded = 5;
+    CmtReleaseLock(lockA);
+    return 0;
+}
+void UiSide(void)
+{
+    CmtGetLock(lockB);
+    gSplit = 2;                          /* lockB ici, lockA dans Bump */
+    CmtReleaseLock(lockB);
+    gOpen = 1;                           /* aucun verrou */
+    CmtGetLock(lockA);
+    gGuarded = 0;
+    CmtReleaseLock(lockA);
+}
+void DrawBare(void)  { SetCtrlAttribute(1, MY_CANVAS, 3, 3); }
+"""
+# Dessins sur une seule ligne: la prise, l'acces et la liberation partagent une ligne,
+# la carte des verrous doit les distinguer par leur colonne.
+_ONE_LINE = "void {name}(void) {{ CmtGetLock({lock}); SetCtrlAttribute(1, MY_CANVAS, {n}, {n}); " \
+            "CmtReleaseLock({lock}); }}\n"
+LOCKED_C += "".join(_ONE_LINE.format(name=name, lock=lock, n=n) for n, (name, lock) in enumerate(
+    [("DrawSafe", "lockC"), ("DrawSafe2", "lockC"), ("DrawWrong", "lockA")]))
+
+
+@pytest.fixture
+def locked(sample):
+    """Le projet d'exemple, avec du code verrouille appele depuis le thread Worker."""
+    path = sample["root"] / "Src" / "worker.c"
+    text = path.read_text(encoding="utf-8")
+    head = "int CVICALLBACK Worker(void *data)\n{"
+    assert head in text
+    path.write_text(text.replace(head, LOCKED_C + head + "\n    Guarded();\n    Early(1);\n"
+                                 "    DrawBare();\n    gOpen = 3;"), encoding="utf-8")
+    return sample
+
+
+def _checks(items, check):
+    return [i for i in items if i["check"] == check]
+
+
+def test_lock_inherited_from_callers_and_early_return(locked):
+    _data, items = _risks()
+    unlocked = {i["global"] for i in _checks(items, "shared_global_unlocked")}
+    assert "gOpen" in unlocked                       # jamais sous verrou
+    assert "gGuarded" not in unlocked   # Bump herite de lockA, Early garde lockA apres return
+    flow = call(server.threads, global_name="gGuarded")
+    bump = next(f for f in flow["writers"] + flow["readers_only"] if f["function"] == "Bump")
+    assert bump["protected_by_callers"] and bump["unlocked_lines"] == []
+    early = next(f for f in flow["writers"] if f["function"] == "Early")
+    assert early["unlocked_lines"] == []
+
+
+def test_inconsistent_lock_between_contexts(locked):
+    _data, items = _risks()
+    conflict = [i for i in _checks(items, "inconsistent_lock") if i["global"] == "gSplit"]
+    assert len(conflict) == 1
+    assert conflict[0]["locks"] == ["lockA", "lockB"]
+    assert {conflict[0]["function"], conflict[0]["other"]["function"]} == {"Bump", "UiSide"}
+    assert not any(i["global"] == "gGuarded" for i in _checks(items, "inconsistent_lock"))
+
+
+def test_ui_control_touched_without_its_usual_lock(locked):
+    _data, items = _risks()
+    found = {i["function"]: i for i in _checks(items, "ui_control_unlocked")}
+    assert set(found) == {"DrawWrong", "DrawBare"}   # DrawSafe et DrawSafe2 tiennent lockC
+    assert found["DrawBare"]["locks"] == ["lockC"] and "aucun verrou" in found["DrawBare"]["why"]
+    assert "seul lockA est tenu" in found["DrawWrong"]["why"]
+    assert found["DrawBare"]["confidence"] == "moyenne"     # dessine depuis un thread
+
+
+def test_lock_map_unit(locked):
+    from cvi_mcp import threads
+    engine = server._engine(server._cfg())
+    try:
+        where, entries = threads.contexts(engine)
+        locks = threads.LockMap(engine, entries)
+        assert "Bump" in locks.covered and locks.inherited["Bump"] == frozenset({"lockA"})
+        assert "Worker" not in locks.covered      # lancee dans un thread: appelable de l'exterieur
+        assert "UiSide" not in locks.covered             # rien ne l'appelle
+    finally:
+        engine.close()
+
+
+# ------------------------------------------ declarations a plusieurs noms --
+
+def test_every_name_of_a_multi_declaration_is_indexed(sample):
+    _append_c(sample, """
+int gMultiA, gMultiB[4], *gMultiC;
+static int gMultiD = 7, gMultiE = 8;
+""")
+    expected = {"gMultiA": "int gMultiA", "gMultiB": "int gMultiB[4]", "gMultiC": "int *gMultiC",
+                "gMultiD": "static int gMultiD = 7", "gMultiE": "static int gMultiE = 8"}
+    for name, signature in expected.items():
+        found = call(server.find_symbol, name=name, exact=True)["results"]
+        assert [(r["kind"], r["signature"]) for r in found] == [("global", signature)], name
+
+
+def test_multi_declaration_reads_and_writes_are_attributed(sample):
+    _append_c(sample, """
+int gPairA, gPairB;
+static void UsePair(void) { gPairB = gPairA + 1; }
+""")
+    assert call(server.find_usages, name="gPairB")["by_kind"] == {"write": 1}
+    assert call(server.find_usages, name="gPairA")["by_kind"] == {"read": 1}
+    assert call(server.dead_code, section="globals", limit=200)["total"] >= 0
+
+
+def test_series_separates_definition_and_usage(sample):
+    """main.c declare gLabel1..4 mais n'utilise que gLabel1 et gLabel2."""
+    labels = {f["series"]: f for f in _items(call(server.series), "families")}
+    early = labels["gLabel<n>"]["files_stopping_early"]
+    assert {"file": "Src/main.c", "stops_at": 2, "in": "usage"} in early
+    assert not any(e["file"] == "Src/main.c" and e["in"] == "definition" for e in early)
+
+
+# ------------------------------------------------- reponses et suggestions --
+
+def test_suggestions_never_propose_the_searched_name(sample):
+    engine = server._engine(server._cfg())
+    try:
+        names = [s["name"] for s in engine.suggest("Handler1")]
+        assert "Handler1" not in names and "Handler2" in names
+    finally:
+        engine.close()
+
+
+def test_find_usages_gives_by_file_overview(sample):
+    usages = call(server.find_usages, name="gLabel1")
+    assert sum(usages["by_file"].values()) == usages["total"]
+    assert list(usages["by_file"].values()) == sorted(usages["by_file"].values(), reverse=True)
+
+
+def test_truncated_list_keeps_a_by_file_summary(sample, monkeypatch):
+    monkeypatch.setenv("CVI_MCP_MAX_CHARS", "700")
+    out = call(server.find_usages, name="gLabel1")
+    note = out["truncated"]["lists"][0]
+    assert note["kept"] < note["had"]
+    assert sum(note["by_file"].values()) == note["had"]    # la liste entiere, pas la partie gardee
+
+
+# ----------------------------------------------------------------- history --
+
+def _git_commit(root, message):
+    import subprocess
+    env = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", *env, "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", *env, "commit", "-qm", message], cwd=root, check=True,
+                   capture_output=True)
+
+
+@pytest.fixture
+def repo(sample):
+    import shutil
+    import subprocess
+    if shutil.which("git") is None:
+        pytest.skip("git absent")
+    subprocess.run(["git", "init", "-q"], cwd=sample["root"], check=True, capture_output=True)
+    _git_commit(sample["root"], "premier")
+    return sample
+
+
+def test_history_without_target_caps_files_per_commit(repo):
+    from cvi_mcp import gitinfo
+    extra = repo["root"] / "Many"
+    extra.mkdir()
+    for i in range(gitinfo.MAX_FILES_PER_COMMIT + 5):
+        (extra / f"f{i}.txt").write_text("x", encoding="utf-8")
+    _git_commit(repo["root"], "beaucoup de fichiers")
+    commits = call(server.history)["commits"]
+    assert commits[0]["subject"] == "beaucoup de fichiers"
+    assert len(commits[0]["files"]) == gitinfo.MAX_FILES_PER_COMMIT
+    assert commits[0]["files_total"] == gitinfo.MAX_FILES_PER_COMMIT + 5
+    first = commits[-1]
+    assert "files_total" not in first or first["files_total"] >= len(first["files"])
+
+
+def test_history_of_function_file_and_unknown_target(repo):
+    main = repo["root"] / "Src" / "main.c"
+    main.write_text(main.read_text(encoding="utf-8") + "\nint Fresh(void) { return 1; }\n",
+                    encoding="utf-8")
+    _git_commit(repo["root"], "ajoute Fresh")
+    by_function = call(server.history, target="Fresh")
+    assert by_function["function"] == "Fresh"
+    assert by_function["commits"][0]["subject"] == "ajoute Fresh"
+    by_file = call(server.history, target="main.c")
+    assert by_file["file"].endswith("main.c") and len(by_file["commits"]) >= 2
+    assert "reason" in call(server.history, target="NoSuchThing")
+
+
+def test_history_without_repository(sample):
+    assert call(server.history)["available"] is False
+
+
+def test_lock_map_is_kept_with_the_project_and_dropped_with_it(locked):
+    from cvi_mcp import risks
+    engine = server._engine(server._cfg())
+    try:
+        first = risks.lock_map(engine)
+        assert risks.lock_map(engine) is first                    # meme projet: reutilise
+        own_pairs = {"MyLock": "MyUnlock"}                        # paires propres: pas de memo
+        assert risks.lock_map(engine, own_pairs) is not first
+    finally:
+        engine.close()
+    worker = locked["root"] / "Src" / "worker.c"
+    worker.write_text(worker.read_text(encoding="utf-8") + "\nint gLater;\n", encoding="utf-8")
+    engine = server._engine(server._cfg())
+    try:
+        assert risks.lock_map(engine) is not first                # fichier modifie: carte neuve
+    finally:
+        engine.close()

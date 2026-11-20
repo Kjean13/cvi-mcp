@@ -2,7 +2,7 @@
 #  cvi_mcp/diffs.py
 #  Role     Instantanes nommes de l'index et comparaison entre deux versions
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -142,6 +142,10 @@ def save_snapshot(conn: sqlite3.Connection, label: str, root: Path | None, overw
         "INSERT INTO snapshot_edges (snapshot_id, caller, callee) VALUES (?, ?, ?)",
         [(snapshot_id, caller, callee) for caller, callee in state["edges"]],
     )
+    conn.executemany(
+        "INSERT INTO snapshot_files (snapshot_id, file) VALUES (?, ?)",
+        [(snapshot_id, file) for file in sorted(state["files"])],
+    )
     conn.commit()
 
     return {
@@ -178,6 +182,7 @@ def delete_snapshot(conn: sqlite3.Connection, label: str) -> dict:
 def _drop(conn: sqlite3.Connection, snapshot_id: int) -> None:
     conn.execute("DELETE FROM snapshot_symbols WHERE snapshot_id = ?", (snapshot_id,))
     conn.execute("DELETE FROM snapshot_edges WHERE snapshot_id = ?", (snapshot_id,))
+    conn.execute("DELETE FROM snapshot_files WHERE snapshot_id = ?", (snapshot_id,))
     conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
 
 
@@ -208,7 +213,11 @@ def load_snapshot(conn: sqlite3.Connection, label: str) -> dict | None:
             (snapshot_id,),
         )
     }
-    files = {key[2] for key in symbols if key[2]}
+    files = {r["file"] for r in conn.execute(
+        "SELECT file FROM snapshot_files WHERE snapshot_id = ?", (snapshot_id,))}
+    if not files:
+        # Instantane ancien, pris avant snapshot_files: les fichiers des symboles.
+        files = {key[2] for key in symbols if key[2]}
     return {"symbols": symbols, "edges": edges, "files": files}
 
 

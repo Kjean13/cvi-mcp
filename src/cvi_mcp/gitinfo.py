@@ -2,7 +2,7 @@
 #  cvi_mcp/gitinfo.py
 #  Role     Historique git en lecture seule, optionnel
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -14,6 +14,9 @@ from pathlib import Path
 from .queries import QueryEngine
 
 _FORMAT = "%h%x1f%ad%x1f%an%x1f%s"
+
+# Fichiers listes par commit: un premier commit peut en contenir des centaines.
+MAX_FILES_PER_COMMIT = 15
 
 
 def _git(args: list[str], cwd: Path, timeout: int = 20) -> str | None:
@@ -54,6 +57,10 @@ def history(engine: QueryEngine, target: str | None, limit: int = 10) -> dict:
                 commits.append(current)
             elif line.strip() and current is not None:
                 current["files"].append(line.strip())
+        for commit in commits:
+            if len(commit["files"]) > MAX_FILES_PER_COMMIT:
+                commit["files_total"] = len(commit["files"])
+                commit["files"] = commit["files"][:MAX_FILES_PER_COMMIT]
         return {"available": True, "repository": str(repo), "commits": commits}
 
     row = engine.db.execute(

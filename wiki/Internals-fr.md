@@ -179,6 +179,35 @@ liberation chez l'appelant. Deux verrous pris dans les deux ordres sont
 signales comme inversion, et une popup, une lecture TCP ou
 `ProcessSystemEvents` verrou tenu comme appel bloquant.
 
+Ou un verrou est tenu
+-------------------------------------------------------------------------------
+
+`threads` et les alertes `shared_global_unlocked`, `inconsistent_lock` et
+`ui_control_unlocked` de `risks` doivent savoir si un verrou est tenu a un
+acces precis, pas seulement si la fonction en prend un. Un enregistreur branche
+sur le meme parcours note, pour chaque instruction, les verrous tenus apres
+elle, par (ligne, colonne): `CmtGetLock(l); x = 1; CmtReleaseLock(l);` sur une
+seule ligne ne s'annule pas. Apres un `return` anticipe qui rend le verrou, la
+suite de la fonction reste sous verrou.
+
+Une fonction herite aussi des verrous tenus a tous ses appels: `Seuillage`
+appelle `LabelFunction` sous `giVerrouVinci`, donc `LabelFunction` et ce
+qu'elle appelle tiennent `giVerrouVinci`. L'heritage est un plus petit point
+fixe: une boucle d'appels ne se protege pas elle-meme. Une fonction que rien
+n'appelle, un callback, une fonction lancee dans un thread, `main` ou une
+fonction dont l'adresse est prise peut etre appelee de l'exterieur et n'herite
+de rien. Deux reponses en sortent: les verrous tenus a coup sur (ce que
+comparent `inconsistent_lock` et `ui_control_unlocked`), et la presence d'un
+verrou quelconque, meme different a chaque appel.
+
+`inconsistent_lock` signale une globale ecrite sous un verrou ici et un autre
+ailleurs, depuis deux contextes qui tournent ensemble. `ui_control_unlocked`
+prend, pour chaque constante de controle (`TELE_CANVAS`), le verrou que prend
+le plus de fonctions autour d'elle et signale les acces qui ne le tiennent pas:
+tenir un autre verrou, comme `giVerrouVinci`, n'exclut pas l'affichage qui
+prend `giVerrouTele`. Deux fonctions static de meme nom dans deux fichiers ne
+sont pas distinguees.
+
 Les ressources suivent le meme parcours: un handle range dans une variable
 locale doit etre libere, renvoye ou range hors de la fonction sur chaque
 chemin. Un test comme `p == NULL`, `!p`, `h < 0`, ou `status == 0` sur le code
@@ -194,12 +223,18 @@ rouvert du tout. Des que l'un des deux a change, le fichier est lu et hache, et
 le hash tranche. Cela evite qu'une restauration d'archive, qui ne preserve ni
 l'un ni l'autre de facon fiable, passe inapercue.
 
-Sur CL150 (74 fichiers, 74 000 lignes, 87 avec les en-tetes atteints) une
-premiere indexation prend environ six secondes, puis un appel coute une
-seconde a une seconde et demie: lister les sources, rejouer le preprocesseur
-sur les directives, verifier les dates. Les analyses qui reanalysent des
-fonctions (`lock_check`, `risks`, `consistency`) restent sous trois secondes,
-`cvi_environment` autour de cinq car il parcourt les dossiers d'installation.
+Le projet assemble (sources, etat du preprocesseur) est aussi garde d'un appel
+a l'autre. Il est reutilise tant que rien de ce dont il depend n'a bouge: les
+reglages, la liste des sources du `.prj`, et la taille et la date de chaque
+fichier lu par le preprocesseur, en-tetes du SDK compris. Le moindre
+changement, ou `reindex`, le reconstruit. `CVI_MCP_INDEX_UNLISTED=1`
+desactive la reutilisation.
+
+Sur CL150 (74 fichiers, 74 000 lignes, 87 avec les en-tetes atteints) un
+premier appel prend trois a cinq secondes, puis un appel coute moins d'un
+dixieme de seconde. Les analyses qui reanalysent des fonctions (`lock_check`,
+`risks`, `threads`, `consistency`) restent sous trois secondes,
+`cvi_environment` autour de quatre car il parcourt les dossiers d'installation.
 
 Limites connues
 -------------------------------------------------------------------------------
@@ -221,9 +256,12 @@ Limites connues
   pointeur calcule parait morte; une fonction dont l'adresse est prise compte
   comme vivante. D'ou `confidence`.
 - **Les risques sont heuristiques**: tailles de tampons lues seulement dans les
-  declarations locales, bornes de `sprintf` sur des valeurs flottantes
-  raisonnables, ressources suivies dans les variables locales seulement, et
-  protection par verrou decidee par fonction pour les threads, pas par ligne.
+  declarations locales et globales `char`, bornes de `sprintf` sur des valeurs
+  flottantes raisonnables (un champ numerique compte sa largeur quand le format
+  la fixe, `%02d`), ressources suivies dans les variables locales seulement.
+  Un verrou est suivi par instruction et d'appelant en appelant, mais deux
+  verrous differents ne s'excluent jamais, et un verrou pris par une fonction
+  que l'outil ne reconnait pas comme enveloppe n'est pas vu.
 - **Non couvert**: tables de traduction (fichiers de langue), bornes des
   tableaux d'E/S face aux limites des protocoles, constantes magiques.
 

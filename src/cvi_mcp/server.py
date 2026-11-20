@@ -2,7 +2,7 @@
 #  cvi_mcp/server.py
 #  Role     Serveur MCP: exposition des outils de lecture du projet CVI
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -153,6 +153,16 @@ def _largest_list(value, path=()):
     return best
 
 
+def _file_summary(items: list) -> dict[str, int]:
+    """Nombre d'elements par fichier (les quinze plus charges), pour une liste
+    d'objets portant une cle "file". Vide si la liste n'en a pas."""
+    counts: dict[str, int] = {}
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("file"), str):
+            counts[item["file"]] = counts.get(item["file"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:15])
+
+
 def _shrink(payload: dict, budget: int) -> dict:
     """Coupe la plus grosse liste jusqu'a tenir dans le budget. Si elle
     appartient a une page (items, offset, next_offset), la page suivante
@@ -172,11 +182,17 @@ def _shrink(payload: dict, budget: int) -> dict:
         keep = max(1, int(len(items) * budget / len(text) * 0.9))
         if keep >= len(items):
             keep = len(items) - 1
+        # Ce qui est coupe ne disparait pas sans trace: la repartition par fichier de
+        # la liste entiere reste dans la note, avant de garder les premiers elements.
+        by_file = _file_summary(items)
         parent[path[-1]] = items[:keep]
         if isinstance(parent, dict) and path[-1] == "items" and "offset" in parent:
             parent["next_offset"] = parent["offset"] + keep
             parent["limit"] = keep
-        notes.append({"list": "/".join(str(p) for p in path), "kept": keep, "had": len(items)})
+        note = {"list": "/".join(str(p) for p in path), "kept": keep, "had": len(items)}
+        if by_file:
+            note["by_file"] = by_file
+        notes.append(note)
     if notes:
         payload["truncated"] = {"budget_chars": budget, "lists": notes,
                                 "hint": "reduire limit ou suivre next_offset"}
@@ -1166,24 +1182,28 @@ def lock_check(kind: str | None = None, limit: int = 30, offset: int = 0) -> str
     return _reply("lock_check", {"kind": kind, "limit": limit, "offset": offset}, payload)
 
 
-_CONFIDENCE_RANK = {"haute": 0, "moyenne": 1, "faible": 2}
+_CONFIDENCE_RANK = riskmod.CONFIDENCE_RANK
 
 
 @mcp.tool()
 def risks(check: str | None = None, file: str | None = None, min_confidence: str = "moyenne",
-          limit: int = 30, offset: int = 0) -> str:
+          limit: int = 30, offset: int = 0, group: bool = True) -> str:
     """Risques C classiques et fuites, sur le code compile, positions et
     explication seulement. check: unbounded_copy, format_mismatch,
     ignored_return, unchecked_alloc, leak_on_return, leak_at_end,
     double_release, ui_from_thread, shared_global_unlocked. min_confidence:
-    haute, moyenne (defaut) ou faible. Paires de ressources supplementaires:
-    "resource_pairs" dans .cvi-mcp.json ([["Ouvre", "Ferme", "return"]])."""
+    haute, moyenne (defaut) ou faible. group (defaut vrai): les copies non
+    bornees d'un meme tampon dans une fonction forment une seule alerte
+    (occurrences, lines); group=false les detaille. Paires de ressources
+    supplementaires: "resource_pairs" dans .cvi-mcp.json ([["Ouvre", "Ferme", "return"]])."""
     cfg = _cfg()
     engine = _engine(cfg)
     try:
         extra = cfg.settings.get("resource_pairs") or []
         checked = cfg.settings.get("checked_calls")
         items = riskmod.c_risks(engine, frozenset(checked) | riskmod.CHECKED_CALLS if checked else None)
+        if group:
+            items = riskmod.group_findings(items)
         items += riskmod.resource_check(engine, extra)["findings"]
         items += threadmod.thread_risks(engine)
         if file:
@@ -1202,6 +1222,9 @@ def risks(check: str | None = None, file: str | None = None, min_confidence: str
         entry = counts.setdefault(item["check"], {"total": 0, "haute": 0, "moyenne": 0, "faible": 0})
         entry["total"] += 1
         entry[item["confidence"]] += 1
+        if item.get("occurrences"):
+            # Une alerte groupee vaut plusieurs ecritures: on garde les deux chiffres.
+            entry["occurrences"] = entry.get("occurrences", 0) + item["occurrences"]
     if check:
         items = [i for i in items if i["check"] == check]
     items.sort(key=lambda i: (_CONFIDENCE_RANK.get(i["confidence"], 2), i["check"], i["file"], i["line"]))
@@ -1216,7 +1239,7 @@ def risks(check: str | None = None, file: str | None = None, min_confidence: str
         "findings": page(items, offset, limit),
     }
     args = {"check": check, "file": file, "min_confidence": min_confidence, "limit": limit,
-            "offset": offset}
+            "offset": offset, "group": group}
     return _reply("risks", args, payload)
 
 

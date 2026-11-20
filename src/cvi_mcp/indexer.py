@@ -2,7 +2,7 @@
 #  cvi_mcp/indexer.py
 #  Role     Indexation des sources C/H du projet vers SQLite
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -443,9 +443,18 @@ class Indexer:
                 self._store_shape(name, file_id, node.start_point[0] + 1, body, source, declarator)
 
     def _add_declaration(self, node, source: bytes, lines: list[str], file_id: int) -> None:
-        declarator = node.child_by_field_name("declarator")
-        if declarator is None:
-            return
+        """Une declaration peut en porter plusieurs: int a, b[4], *c; donne
+        trois symboles. Chacun garde le type de la declaration et son propre
+        declarateur, pour que sa signature se lise seule (int b[4])."""
+        for index, declarator in enumerate(node.children_by_field_name("declarator")):
+            self._add_declarator(node, declarator, index, source, lines, file_id)
+
+    def _add_declarator(self, node, declarator, index: int, source: bytes, lines: list[str],
+                        file_id: int) -> None:
+        # Le premier declarateur garde la plage de lignes de toute la declaration,
+        # les suivants la leur: on les retrouve a leur ligne.
+        line_start = node.start_point[0] + 1 if index == 0 else declarator.start_point[0] + 1
+        line_end = node.end_point[0] + 1 if index == 0 else declarator.end_point[0] + 1
 
         has_params = declarator.type == "function_declarator" or any(
             child.type == "function_declarator" for child in walk(declarator)
@@ -464,8 +473,8 @@ class Indexer:
                 file_id=file_id,
                 name=name,
                 kind="prototype",
-                line_start=node.start_point[0] + 1,
-                line_end=node.end_point[0] + 1,
+                line_start=line_start,
+                line_end=line_end,
                 signature=" ".join(text_of(source, node).split()).rstrip(";"),
                 params=json.dumps(params, ensure_ascii=False),
                 doc_comment=leading_comment(lines, node.start_point[0]),
@@ -474,14 +483,19 @@ class Indexer:
 
         name = _declared_name(declarator, source) or self._plain_name(text_of(source, declarator))
         if name:
-            self._add_initializer_refs(node, source, file_id, name)
+            self._add_initializer_refs(declarator, source, file_id, name)
+            # Type de la declaration (tout ce qui precede le premier declarateur)
+            # suivi de ce declarateur seul.
+            first = node.children_by_field_name("declarator")[0]
+            specifiers = source[node.start_byte : first.start_byte].decode(
+                "utf-8", errors="replace")
             self._insert_symbol(
                 file_id=file_id,
                 name=name,
                 kind="global",
-                line_start=node.start_point[0] + 1,
-                line_end=node.end_point[0] + 1,
-                signature=" ".join(text_of(source, node).split()).rstrip(";"),
+                line_start=line_start,
+                line_end=line_end,
+                signature=" ".join((specifiers + text_of(source, declarator)).split()).rstrip(";"),
                 is_static=1 if any(
                     child.type == "storage_class_specifier"
                     and text_of(source, child) == "static"
@@ -670,7 +684,9 @@ class Indexer:
     def _add_initializer_refs(self, node, source: bytes, file_id: int, owner: str) -> None:
         """Noms cites dans l'initialiseur d'une globale: tables de callbacks,
         listes de panneaux, constantes."""
-        for child in walk(node):
+        # walk() ne rend que les descendants: la racine compte quand elle est
+        # elle-meme l'init_declarator (un seul nom declare avec son initialiseur).
+        for child in (node, *walk(node)):
             if child.type != "init_declarator":
                 continue
             value = child.child_by_field_name("value")

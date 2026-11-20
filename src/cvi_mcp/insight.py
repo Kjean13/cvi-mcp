@@ -3,7 +3,7 @@
 #  Role     Recherche et navigation: texte, theme, voisins, series numerotees,
 #           impact d'un changement, resume et squelette de fonction
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -368,31 +368,41 @@ def series(engine: QueryEngine, name: str | None = None, min_members: int = 3,
            limit: int = 30, offset: int = 0) -> dict:
     """Suites numerotees d'identifiants (X1, X2... Xn) et de chaines
     litterales: etendue, trous, et fichiers ou la suite s'arrete plus tot
-    qu'ailleurs (un endroit oublie lors du dernier ajout)."""
-    names: dict[str, set[int]] = {}
+    qu'ailleurs (un endroit oublie lors du dernier ajout).
+
+    Un fichier est juge a deux titres, separement: ses definitions (declaration,
+    #define) et ses usages (appels, lectures, chaines). Un fichier qui declare
+    gLabel1 a gLabel4 mais n'initialise que gLabel1 et gLabel2 s'arrete bien a 2
+    cote usage, meme si sa declaration va jusqu'a 4."""
+    used: dict[str, set[int]] = {}
+    defined: dict[str, set[int]] = {}
     for r in engine.db.execute(
         "SELECT DISTINCT r.name, r.file_id FROM refs r WHERE r.kind NOT IN ('return', 'cond')"
     ):
-        names.setdefault(r["name"], set()).add(r["file_id"])
+        used.setdefault(r["name"], set()).add(r["file_id"])
     for r in engine.db.execute("SELECT DISTINCT name, file_id FROM symbols"):
-        names.setdefault(r["name"], set()).add(r["file_id"])
+        defined.setdefault(r["name"], set()).add(r["file_id"])
     for r in engine.db.execute(
         "SELECT DISTINCT a.text, r.file_id FROM call_args a JOIN refs r ON a.ref_id = r.id "
         "WHERE a.text LIKE '\"%'"
     ):
         literal = _unquote(r["text"])
         if re.fullmatch(r"[A-Za-z_]\w*", literal):
-            names.setdefault(f'"{literal}"', set()).add(r["file_id"])
+            used.setdefault(f'"{literal}"', set()).add(r["file_id"])
 
-    families: dict[tuple[str, str], dict[int, set[int]]] = {}
-    for full, files in names.items():
-        quoted = full.startswith('"')
-        key = _series_key(full.strip('"'))
-        if key is None:
-            continue
-        prefix, number, suffix = key
-        family = families.setdefault((('"' if quoted else "") + prefix, suffix), {})
-        family.setdefault(number, set()).update(files)
+    # famille -> {"all": numero -> fichiers, "use": ..., "def": ...}
+    families: dict[tuple[str, str], dict[str, dict[int, set[int]]]] = {}
+    for role, names in (("use", used), ("def", defined)):
+        for full, files in names.items():
+            quoted = full.startswith('"')
+            key = _series_key(full.strip('"'))
+            if key is None:
+                continue
+            prefix, number, suffix = key
+            family = families.setdefault((('"' if quoted else "") + prefix, suffix),
+                                         {"all": {}, "use": {}, "def": {}})
+            for bucket in ("all", role):
+                family[bucket].setdefault(number, set()).update(files)
 
     paths = {r["id"]: engine.rel(r["path"]) for r in engine.db.execute("SELECT id, path FROM files")}
     generated = {r[0] for r in engine.db.execute("SELECT id FROM files WHERE origin != 'project'")}
@@ -404,7 +414,8 @@ def series(engine: QueryEngine, name: str | None = None, min_members: int = 3,
         wanted = (key[0], key[2]) if key else None
         stem = name.strip('"').rstrip("0123456789").lower()
     out = []
-    for (prefix, suffix), members in families.items():
+    for (prefix, suffix), roles in families.items():
+        members = roles["all"]
         if len(members) < min_members:
             continue
         if name and not (
@@ -416,17 +427,21 @@ def series(engine: QueryEngine, name: str | None = None, min_members: int = 3,
         if high - low + 1 > 2 * len(numbers):
             continue  # nombres epars (adresses, codes): pas une suite
         gaps = [n for n in range(low, high + 1) if n not in members]
-        per_file: dict[int, int] = {}
-        for number, files in members.items():
-            for fid in files:
-                per_file[fid] = max(per_file.get(fid, 0), number)
-        enumerating = {fid: top for fid, top in per_file.items()
-                       if fid not in generated
-                       and sum(1 for files in members.values() if fid in files) >= 2}
-        short = sorted(
-            ({"file": paths.get(fid, "?"), "stops_at": top} for fid, top in enumerating.items()
-             if top < high),
-            key=lambda x: x["stops_at"])
+        enumerating: set[int] = set()
+        short: list[dict] = []
+        for role, label_role in (("use", "usage"), ("def", "definition")):
+            per_file: dict[int, int] = {}
+            for number, files in roles[role].items():
+                for fid in files:
+                    per_file[fid] = max(per_file.get(fid, 0), number)
+            for fid, top in per_file.items():
+                # Un fichier enumere la suite quand il cite au moins deux de ses membres.
+                if fid in generated or sum(1 for f in roles[role].values() if fid in f) < 2:
+                    continue
+                enumerating.add(fid)
+                if top < high:
+                    short.append({"file": paths.get(fid, "?"), "stops_at": top, "in": label_role})
+        short.sort(key=lambda x: (x["stops_at"], x["file"], x["in"]))
         label = f"{prefix}<n>{suffix}"
         sample = f"{prefix.strip(chr(34))}{low}{suffix}"
         nature = "ui_controls" if sample in controls else "strings" if prefix.startswith('"') else "identifiers"
@@ -441,7 +456,8 @@ def series(engine: QueryEngine, name: str | None = None, min_members: int = 3,
                             -e["members"], e["series"]))
     result = {"families": page(out, offset, limit),
               "note": "files_stopping_early: fichier qui enumere la suite mais s'arrete avant le "
-                      "maximum vu ailleurs, endroit souvent oublie lors d'un ajout. Le code "
+                      "maximum vu ailleurs, endroit souvent oublie lors d'un ajout. in: usage "
+                      "(appels, lectures, chaines) ou definition (declaration, #define). Le code "
                       "exclu par un #if compte: il est souvent ecrit d'avance pour plus d'elements"}
     if name and not out:
         result["reason"] = f"aucune suite numerotee ne correspond a '{name}'"

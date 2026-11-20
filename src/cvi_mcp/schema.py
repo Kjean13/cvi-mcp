@@ -2,7 +2,7 @@
 #  cvi_mcp/schema.py
 #  Role     Schema SQLite de l'index et migration par numero de version
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -159,6 +159,15 @@ CREATE TABLE IF NOT EXISTS snapshot_symbols (
     active      INTEGER DEFAULT 1
 );
 
+-- Fichiers de l'instantane. Sans cette table un fichier sans symbole (une
+-- unite qui ne fait qu'inclure) disparaissait de l'instantane et revenait
+-- comme "ajoute" a la comparaison. Les anciens instantanes n'ont pas de ligne
+-- ici: load_snapshot retombe alors sur les fichiers de leurs symboles.
+CREATE TABLE IF NOT EXISTS snapshot_files (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+    file        TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS snapshot_edges (
     snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
     caller      TEXT NOT NULL,
@@ -177,6 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_blocks_file     ON pp_blocks(file_id);
 CREATE INDEX IF NOT EXISTS idx_sdk_symbols_nam ON sdk_symbols(name);
 CREATE INDEX IF NOT EXISTS idx_snap_sym        ON snapshot_symbols(snapshot_id, name);
 CREATE INDEX IF NOT EXISTS idx_snap_edge       ON snapshot_edges(snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_snap_file       ON snapshot_files(snapshot_id);
 """
 
 # Tables du projet, remises a zero par un reindex force.
@@ -184,6 +194,7 @@ PROJECT_TABLES = ("call_args", "refs", "symbols", "includes", "pp_blocks", "file
 
 # Tout l'index, detruit lors d'un changement de version de schema.
 ALL_TABLES = PROJECT_TABLES + (
+    "snapshot_files",
     "snapshot_edges",
     "snapshot_symbols",
     "snapshots",

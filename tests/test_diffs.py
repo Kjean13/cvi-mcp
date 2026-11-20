@@ -209,3 +209,35 @@ def test_state_of_path_leaves_main_index_alone(db, indexed, variant):
     diffs.state_of_path(variant, _only(variant))
     after = db.db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     assert before == after
+
+
+def _add_symbolless_file(db, root):
+    """Un fichier indexe qui ne definit rien: une unite qui ne fait qu'inclure."""
+    db.db.execute("INSERT INTO files (path, hash, lines, origin) VALUES (?, 'h', 2, 'project')",
+                  (str(root / "empty_unit.c"),))
+    db.db.commit()
+    return "empty_unit.c"
+
+
+def test_snapshot_keeps_files_without_symbols(db, indexed):
+    name = _add_symbolless_file(db, indexed["root"])
+    diffs.save_snapshot(db.db, "v1", indexed["root"])
+    before = diffs.load_snapshot(db.db, "v1")
+    assert name in before["files"]
+    report = diffs.compare(before, diffs.capture_state(db.db, indexed["root"]), "v1", "current")
+    assert report["identical"] is True and report["files_added"] == []
+
+
+def test_old_snapshot_without_file_list_still_loads(db, indexed):
+    """Un instantane pris avant snapshot_files retombe sur les fichiers de ses symboles."""
+    diffs.save_snapshot(db.db, "v1", indexed["root"])
+    db.db.execute("DELETE FROM snapshot_files")
+    state = diffs.load_snapshot(db.db, "v1")
+    assert state["files"] and all(isinstance(f, str) for f in state["files"])
+
+
+def test_delete_snapshot_removes_its_file_list(db, indexed):
+    diffs.save_snapshot(db.db, "v1", indexed["root"])
+    assert db.db.execute("SELECT COUNT(*) FROM snapshot_files").fetchone()[0] > 0
+    diffs.delete_snapshot(db.db, "v1")
+    assert db.db.execute("SELECT COUNT(*) FROM snapshot_files").fetchone()[0] == 0

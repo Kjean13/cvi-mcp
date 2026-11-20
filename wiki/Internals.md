@@ -166,6 +166,33 @@ caller. Two locks taken in both orders are reported as an inversion, and a
 popup, a TCP read or `ProcessSystemEvents` while a lock is held as a blocking
 call.
 
+Where a lock is held
+-------------------------------------------------------------------------------
+
+`threads` and the `shared_global_unlocked`, `inconsistent_lock` and
+`ui_control_unlocked` checks of `risks` need to know whether a lock is held at
+a given access, not just whether the function takes one. A recorder on the same
+path walker notes, for each statement, the locks held after it, keyed by
+(line, column) so that `CmtGetLock(l); x = 1; CmtReleaseLock(l);` on one line
+does not cancel itself. After an early `return` that releases the lock, the
+rest of the function stays under it.
+
+A function also inherits the locks held at all its call sites: `Seuillage`
+calls `LabelFunction` under `giVerrouVinci`, so `LabelFunction` and what it
+calls hold `giVerrouVinci`. The inheritance is a least fixed point, so a loop of
+calls does not protect itself. A function nothing calls, a callback, a function
+started in a thread, `main` or a function whose address is taken may be called
+from outside and inherits nothing. Two answers come out: the locks held for
+sure (what `inconsistent_lock` and `ui_control_unlocked` compare), and whether
+any lock is held, even a different one at each call.
+
+`inconsistent_lock` reports a global written under one lock here and another
+there, from two contexts that run together. `ui_control_unlocked` takes, per
+control constant (`TELE_CANVAS`), the lock most functions take around it and
+reports the accesses that do not hold it: holding another lock, like
+`giVerrouVinci`, does not exclude the display that takes `giVerrouTele`. Two
+static functions of the same name in two files are not told apart.
+
 Resources follow the same walk: a handle stored in a local variable must be
 released, returned or stored outside the function on every path. A test such
 as `p == NULL`, `!p`, `h < 0`, or `status == 0` on the return code of the
@@ -180,12 +207,17 @@ size and modification time are unchanged is not reopened at all. When either
 moved, the file is read and hashed, and the hash decides. That keeps an
 archive restore, which preserves neither reliably, from going unnoticed.
 
+The assembled project (sources, preprocessor state) is also kept between calls.
+It is reused while nothing it depends on changed: the settings, the list of
+sources in the `.prj`, and the size and date of every file the preprocessor
+read, SDK headers included. A change to any of them, or `reindex`, rebuilds it.
+`CVI_MCP_INDEX_UNLISTED=1` turns the reuse off.
+
 On CL150 (74 files, 74 000 lines, 87 once the reached headers are added) a
-first indexing takes about six seconds, then a call costs one to one and a half
-seconds: listing the sources, replaying the preprocessor on directives, checking
-dates. Analyses that reparse functions (`lock_check`, `risks`, `consistency`)
-stay under three seconds, `cvi_environment` around five because it walks the
-installation folders.
+first call takes three to five seconds, then a call costs under a tenth of a
+second. Analyses that reparse functions (`lock_check`, `risks`, `threads`,
+`consistency`) stay under three seconds, `cvi_environment` around four because
+it walks the installation folders.
 
 Known limits
 -------------------------------------------------------------------------------
@@ -205,10 +237,13 @@ Known limits
 - **Dead code** follows names: a function reached only through a computed
   pointer looks dead; one whose address is taken counts as alive. Hence
   `confidence`.
-- **Risks are heuristics**: buffer sizes come from local declarations only,
-  `sprintf` bounds assume reasonable float values, resources are followed in
-  local variables only, and thread analysis decides lock protection per
-  function, not per line.
+- **Risks are heuristics**: buffer sizes come from local declarations and
+  `char` globals, `sprintf` bounds assume reasonable float values and a
+  numeric field is taken at its width when the format fixes one (`%02d`),
+  resources are followed in local variables only. A lock is followed per
+  statement and through callers, but two different locks never exclude each
+  other, and a lock taken through a function the tool does not recognise as a
+  wrapper is not seen.
 - **Not covered**: translation tables (language files), bounds of I/O arrays
   against protocol limits, magic constants.
 

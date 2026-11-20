@@ -2,7 +2,7 @@
 #  cvi_mcp/queries.py
 #  Role     Lectures sur l'index: vue d'ensemble, symboles, usages, appels
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.3.3
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -310,6 +310,8 @@ class QueryEngine:
         scored.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
         out, families = [], set()
         for _score, candidate in scored:
+            if candidate == query:
+                continue   # on ne propose jamais le nom qu'on vient de chercher
             family = re.sub(r"\d+", "#", candidate)
             if family in families:
                 continue
@@ -466,9 +468,13 @@ class QueryEngine:
                 entry["active"] = False
             items.append(entry)
         by_kind: dict[str, int] = {}
+        by_file: dict[str, int] = {}
         for item in items:
             by_kind[item["kind"]] = by_kind.get(item["kind"], 0) + 1
-        return {"total": len(items), "by_kind": by_kind,
+            by_file[item["file"]] = by_file.get(item["file"], 0) + 1
+        # by_file garde la vue d'ensemble quand la liste est tronquee par le budget.
+        top_files = dict(sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0]))[:15])
+        return {"total": len(items), "by_kind": by_kind, "by_file": top_files,
                 "inactive_excluded": 0 if self.include_inactive else len(inactive),
                 "items": items[: max(limit, 0)] if limit else items}
 
