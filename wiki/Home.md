@@ -2,7 +2,7 @@ Home
 ===============================================================================
 
 `cvi-mcp` is a read-only MCP server for LabWindows/CVI projects. It indexes the
-C sources into SQLite outside the project and exposes thirty-eight tools, so an
+C sources into SQLite outside the project and exposes forty tools, so an
 agent can answer questions about a codebase it has never seen.
 
 It exists for one situation: you open an unfamiliar CVI project and need to

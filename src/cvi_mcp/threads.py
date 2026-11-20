@@ -4,7 +4,7 @@
 #           timers asynchrones. Globales partagees, flux de donnees, verrous
 #           suivis ligne par ligne et d'appelant en appelant.
 #  Etat     stable
-#  Version  0.3.3
+#  Version  0.4.0
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -315,9 +315,41 @@ def shared_globals(engine: QueryEngine, where: dict, locks: LockMap) -> list[dic
         conflict = _lock_conflict(accesses, where)
         if conflict:
             item["conflicting_locks"] = conflict
+        usual = _usual_lock(accesses, locks)
+        if usual:
+            gaps = [s for s in accesses if usual not in s["held"]]
+            item["usual_lock"] = usual
+            item["lock_gaps"] = [
+                {"function": s["function"], "file": s["file"], "line": s["line"],
+                 "held": sorted(s["held"])}
+                for s in sorted(gaps, key=lambda s: (s["file"], s["line"]))[:5]]
+            item["lock_gaps_total"] = len(gaps)
         out.append(item)
     out.sort(key=lambda g: (g["confidence"] != "moyenne", -len(g["functions_without_lock"]), g["global"]))
     return out
+
+
+# Part des fonctions qui touchent une donnee et doivent prendre un verrou pour qu'il soit
+# reconnu comme le sien. Sous ce seuil, le verrou est tenu par hasard (un verrou d'alarmes
+# pris pendant qu'on lit un parametre) et ne dit rien de ce que le code protege.
+USUAL_LOCK_SHARE = 0.4
+
+
+def _usual_lock(accesses: list[dict], locks: "LockMap") -> str | None:
+    """Le verrou qui protege cette donnee: celui que prennent le plus de fonctions
+    autour de ses acces, a condition qu'au moins deux le prennent et qu'elles soient une
+    part notable (USUAL_LOCK_SHARE) de celles qui touchent la donnee. Un verrou pris par
+    une seule fonction ne dit rien de l'intention du code. Les fonctions comptent, pas
+    les lignes: un verrou herite par une fonction qui touche dix fois la donnee ne pese
+    pas dix fois."""
+    users: dict[str, set[str]] = {}
+    touching = {site["function"] for site in accesses}
+    for site in accesses:
+        for handle in locks.own(site["function"], site["line"], site["col"]):
+            users.setdefault(handle, set()).add(site["function"])
+    strong = {handle: len(functions) for handle, functions in users.items()
+              if len(functions) >= 2 and len(functions) >= USUAL_LOCK_SHARE * len(touching)}
+    return max(sorted(strong), key=strong.get) if strong else None
 
 
 def _lock_conflict(accesses: list[dict], where: dict) -> dict | None:
@@ -422,7 +454,23 @@ def thread_risks(engine: QueryEngine) -> list[dict]:
                         "why": f"{r['name']} appele depuis {', '.join(secondary)}: passer par "
                                "PostDeferredCall pour agir sur l'interface"})
     for item in shared_globals(engine, where, locks):
-        first = item["unprotected_accesses"][0] if item["unprotected_accesses"] else None
+        gaps = item.get("lock_gaps")
+        if gaps:
+            # La donnee a un verrou (au moins deux fonctions le prennent): un acces qui
+            # ne le tient pas est un oubli probable, pas un choix. Pas besoin du second constat.
+            first = gaps[0]
+            held_text = "aucun verrou" if all(not g["held"] for g in gaps) else "un autre verrou"
+            out.append({
+                "check": "lock_gap", "function": first["function"], "file": first["file"],
+                "line": first["line"], "global": item["global"], "locks": [item["usual_lock"]],
+                "lines": [g["line"] for g in gaps], "contexts": item["accessed_in"],
+                "occurrences": item["lock_gaps_total"], "confidence": "moyenne",
+                "why": f"{item['global']} est protegee par {item['usual_lock']} dans plusieurs "
+                       f"fonctions, mais pas ici ({held_text}): "
+                       f"{item['lock_gaps_total']} acces sans lui"})
+            first = None
+        else:
+            first = item["unprotected_accesses"][0] if item["unprotected_accesses"] else None
         if first:
             out.append({"check": "shared_global_unlocked", "function": first["function"],
                         "file": first["file"], "line": first["line"], "global": item["global"],
@@ -483,6 +531,9 @@ THREAD_NOTES = {
     "les appels de sa fonction se font verrou tenu",
     "inconsistent_lock": "globale protegee par un verrou ici et par un autre ailleurs, sans "
     "verrou commun: les deux acces peuvent s'executer en meme temps",
+    "lock_gap": "globale que plusieurs fonctions protegent par le meme verrou (usual_lock) et "
+    "qu'un acces touche sans lui: oubli probable. Remplace shared_global_unlocked quand la "
+    "donnee a un verrou reconnu",
     "ui_control_unlocked": "controle d'interface (souvent un canvas) touche verrou tenu a un "
     "endroit et sans verrou a un autre, alors que plusieurs threads l'utilisent",
 }

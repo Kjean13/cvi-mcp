@@ -208,11 +208,41 @@ tenir un autre verrou, comme `giVerrouVinci`, n'exclut pas l'affichage qui
 prend `giVerrouTele`. Deux fonctions static de meme nom dans deux fichiers ne
 sont pas distinguees.
 
+Le verrou qui protege une donnee s'apprend dans le code. Pour une globale, c'est
+le verrou que prennent le plus de fonctions autour de ses acces, a condition
+qu'au moins deux fonctions le prennent et qu'elles soient au moins 40 % de
+celles qui touchent la globale (`USUAL_LOCK_SHARE`): en dessous, le verrou est
+tenu par hasard. Un acces qui ne le tient pas est un `lock_gap`, qui remplace
+`shared_global_unlocked` pour cette globale. Les fonctions comptent, pas les
+lignes, et les verrous herites ne pesent pas: la question est quel verrou les
+auteurs prennent a dessein.
+
 Les ressources suivent le meme parcours: un handle range dans une variable
 locale doit etre libere, renvoye ou range hors de la fonction sur chaque
 chemin. Un test comme `p == NULL`, `!p`, `h < 0`, ou `status == 0` sur le code
 retour de la prise, retire la ressource de la branche ou elle n'existe pas. Un
 `goto` arrete le parcours; les alertes portent alors `confidence: moyenne`.
+
+Un handle qui sort de la fonction est suivi a travers les fonctions du projet.
+Chaque fonction recoit un resume: les parametres qu'elle libere (directement,
+ou en les confiant a une fonction qui le fait), ceux qu'elle garde (ranges
+ailleurs ou renvoyes), et les familles de ressource qu'elle renvoie. Un appel
+fait alors ce que dit le resume: liberer le handle, le faire echapper, le
+laisser suivi (l'appelee ne fait que l'utiliser, donc une fuite apres l'appel
+se voit), ou demarrer le suivi d'une nouvelle ressource quand l'appelee en
+renvoie une, comme un `fopen` enrobe. Les resumes se recalculent jusqu'a ne
+plus bouger (quatre tours au plus); une fonction sans resume, ou hors du
+projet, n'est pas supposee prendre la propriete: les appels a la bibliotheque,
+comme `fprintf`, ne font qu'emprunter. Les resumes sont gardes avec le projet.
+
+Trois autres verifications utilisent les memes arbres. `unread_return` suit un
+code de retour range dans une variable: jamais lu dans la fonction, c'est
+`haute`, ecrase avant d'etre lu `moyenne`; une valeur utilisee dans la meme
+expression, ou relue au tour suivant d'une boucle, est laissee. `uninitialized_use`
+signale une locale dont la premiere occurrence est une lecture; une ecriture,
+`&x` (l'appele la remplit), `va_start`, un tableau ou un `static` la met hors de
+cause, donc une initialisation qui ne couvre que certaines branches n'est pas
+vue.
 
 Performance
 -------------------------------------------------------------------------------

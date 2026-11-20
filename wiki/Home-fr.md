@@ -2,7 +2,7 @@ Accueil
 ===============================================================================
 
 `cvi-mcp` est un serveur MCP en lecture seule pour projets LabWindows/CVI. Il
-indexe les sources C dans une base SQLite hors du projet et expose trente-huit
+indexe les sources C dans une base SQLite hors du projet et expose quarante
 outils, pour qu'un agent reponde a des questions sur un code qu'il decouvre.
 
 Il existe pour une situation precise: tu ouvres un projet CVI inconnu et tu

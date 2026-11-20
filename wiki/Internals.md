@@ -193,11 +193,39 @@ reports the accesses that do not hold it: holding another lock, like
 `giVerrouVinci`, does not exclude the display that takes `giVerrouTele`. Two
 static functions of the same name in two files are not told apart.
 
+The lock that protects a piece of data is learned from the code. For a global,
+it is the lock taken by the most functions around its accesses, provided at
+least two functions take it and they are at least 40 % of those that touch the
+global (`USUAL_LOCK_SHARE`): below that the lock is held by chance. An access
+that does not hold it is a `lock_gap`, which replaces `shared_global_unlocked`
+for that global. Functions count, not lines, and inherited locks do not weigh
+in: the question is which lock the authors take on purpose.
+
 Resources follow the same walk: a handle stored in a local variable must be
 released, returned or stored outside the function on every path. A test such
 as `p == NULL`, `!p`, `h < 0`, or `status == 0` on the return code of the
 acquiring call, removes the resource from the branch where it does not exist.
 A `goto` stops the walk; findings then carry `confidence: moyenne`.
+
+A handle that leaves the function is followed through the project's functions.
+Every function gets a summary: which parameters it releases (directly, or by
+handing them to a function that does), which it keeps (stored outside, or
+returned), and which families of resource it returns. A call then does what the
+summary says: release the handle, make it escape, leave it tracked (the callee
+only uses it, so a leak after the call is seen), or start tracking a new
+resource when the callee returns one, as a wrapped `fopen` does. Summaries are
+recomputed until they stop moving (four rounds at most) and a function with no
+summary, or one outside the project, is not assumed to take ownership: calls to
+the library, like `fprintf`, only borrow. The summaries are kept with the
+project.
+
+Three more checks use the same trees. `unread_return` follows a return code
+stored in a variable: never read in the function is `haute`, overwritten before
+being read `moyenne`; a value used in the same expression, or read again on the
+next turn of a loop, is left alone. `uninitialized_use` reports a local whose
+first occurrence is a read; a write, `&x` (the callee fills it), `va_start`, an
+array or a `static` clears it, so an initialisation that covers only some
+branches is not seen.
 
 Performance
 -------------------------------------------------------------------------------

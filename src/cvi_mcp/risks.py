@@ -3,7 +3,7 @@
 #  Role     Suivi chemin par chemin des verrous et ressources, risques C
 #           classiques. Positions et explications seulement, jamais de code.
 #  Etat     stable
-#  Version  0.3.3
+#  Version  0.4.0
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -18,6 +18,16 @@ from .queries import QueryEngine
 # Rang d'une confiance: plus petit = plus sur. Partage avec le serveur et avec
 # threads.py pour que le tri et le seuil min_confidence parlent la meme langue.
 CONFIDENCE_RANK = {"haute": 0, "moyenne": 1, "faible": 2}
+
+# Les alertes de risks, de la plus grave a la moins grave. A confiance egale c'est cet
+# ordre qui decide de ce qui reste quand la reponse est coupee par le budget de taille:
+# une fuite ou un plantage ne doit pas disparaitre derriere deux cents copies de chaine.
+CHECKS = (
+    "leak_on_return", "double_release", "leak_at_end", "unchecked_alloc", "uninitialized_use",
+    "unread_return", "ignored_return", "lock_gap", "inconsistent_lock", "ui_control_unlocked",
+    "ui_from_thread", "unbounded_copy", "format_mismatch", "shared_global_unlocked",
+)
+CHECK_RANK = {name: rank for rank, name in enumerate(CHECKS)}
 
 # Verrous: fonction de prise -> fonction de liberation. Le verrou est nomme
 # par sa fonction de liberation et son premier argument. CmtTryToGetLock est
@@ -62,7 +72,7 @@ BLOCKING_CALLS = frozenset(
 
 # Fonctions dont le code de retour signale un echec qu'on ne devrait pas ignorer.
 CHECKED_CALLS = frozenset(
-    ["LoadPanel", "LoadPanelEx", "OpenFile", "ConnectToTCPServer", "RegisterTCPServer", "ClientTCPRead", "ClientTCPWrite", "ServerTCPRead", "ServerTCPWrite", "Ini_ReadFromFile", "Ini_WriteToFile", "CmtScheduleThreadPoolFunction", "CmtScheduleThreadPoolFunctionAdv", "NewAsyncTimer", "DBConnect", "DBActivateSQL", "DBImmediateSQL", "OpenComConfig", "fopen", "malloc", "calloc", "ReadFile", "WriteFile", "CopyFile", "DeleteFile", "MakeDir"]
+    ["LoadPanel", "LoadPanelEx", "OpenFile", "ConnectToTCPServer", "RegisterTCPServer", "ClientTCPRead", "ClientTCPWrite", "ServerTCPRead", "ServerTCPWrite", "Ini_ReadFromFile", "Ini_WriteToFile", "CmtScheduleThreadPoolFunction", "CmtScheduleThreadPoolFunctionAdv", "NewAsyncTimer", "DBConnect", "DBActivateSQL", "DBImmediateSQL", "DBFetchNext", "OpenComConfig", "fopen", "malloc", "calloc", "ReadFile", "WriteFile", "CopyFile", "DeleteFile", "MakeDir"]
 )
 
 # Famille printf: position de la chaine de format.
@@ -614,13 +624,30 @@ LOCK_NOTES = {
 
 # -------------------------------------------------------------- ressources -----
 
+def _empty_summary() -> dict:
+    """Ce qu'une fonction fait des ressources qu'elle recoit ou produit.
+
+    releases: indice de parametre -> familles (nom de la prise) qu'elle libere.
+    keeps: indices de parametres qu'elle garde (ranges hors de la fonction ou renvoyes).
+    returns: familles qu'elle renvoie, prises dans la fonction et non liberees."""
+    return {"releases": {}, "keeps": set(), "returns": set()}
+
+
 class _ResourceWalker(PathWalker):
     """Ressource affectee a une variable locale: fichier, memoire, panneau,
     bitmap, handle. Un test d'invalidite (x == NULL, x < 0, !x) annule la
     ressource dans la branche ou elle n'existe pas; un return ou une copie
-    hors de la fonction la fait sortir du suivi."""
+    hors de la fonction la fait sortir du suivi.
 
-    def __init__(self, source, specs, locals_, project_functions, returns) -> None:
+    Avec des resumes de fonctions (summaries), un handle passe a une fonction du
+    projet n'echappe plus par principe: si la fonction le libere, il est libere;
+    si elle le garde ou si on ne sait rien d'elle, il echappe; si elle ne fait que
+    l'utiliser, il reste suivi et la fuite apres l'appel est vue. Une fonction qui
+    renvoie une ressource prise (un fopen enrobe) en est une prise a son tour.
+    Le walker note aussi le resume de la fonction qu'il parcourt (self.summary)."""
+
+    def __init__(self, source, specs, locals_, project_functions, returns,
+                 summaries=None, params=None) -> None:
         super().__init__(source, self._track, returns)
         self.specs = specs
         self.release = {}
@@ -629,6 +656,9 @@ class _ResourceWalker(PathWalker):
         self.locals = locals_
         self.project_functions = project_functions
         self.status: dict[str, str] = {}
+        self.summaries = summaries or {}
+        self.params = params or {}              # nom du parametre -> indice
+        self.summary = _empty_summary()
 
     def _target(self, call, args, where) -> str | None:
         if where == "return":
@@ -647,12 +677,21 @@ class _ResourceWalker(PathWalker):
         index = int(where[3:])
         return _handle(args, index) or None
 
+    def _returned_directly(self, call) -> bool:
+        """L'appel est la valeur d'un return: la ressource passe a l'appelant."""
+        parent = call.parent
+        while parent is not None and parent.type in ("parenthesized_expression", "cast_expression"):
+            parent = parent.parent
+        return parent is not None and parent.type == "return_statement"
+
     def _track(self, call, state, walker) -> None:
         name = _callee(call, self.source)
         args = _args(call, self.source)
         line = call.start_point[0] + 1
         for acquire, release, where in self.specs:
             if name == acquire:
+                if where == "return" and self._returned_directly(call):
+                    self.summary["returns"].add(acquire)
                 target = self._target(call, args, where)
                 if target and target in self.locals and not self.locals[target].get("param"):
                     key = f"{acquire}->{target}"
@@ -665,31 +704,69 @@ class _ResourceWalker(PathWalker):
                 return
         if name in self.release and args:
             handle = _handle(args, 0)
-            for acquire, _where in self.release[name]:
-                key = f"{acquire}->{handle}"
-                entry = state.get(key)
-                if entry is None:
-                    continue
-                if entry[0] == 0 and entry[1]:
-                    self.findings.append({"kind": "double_release", "line": line, "key": key,
-                                          "acquired_line": self.taken_at.get(key)})
-                entry[0], entry[1] = 0, True
+            self._release(handle, [acquire for acquire, _w in self.release[name]], state, line)
             return
         if name in self.project_functions:
-            for arg in args:
-                self._escape(arg.lstrip("&"), state)
+            self._call_project_function(call, name, args, state, line)
 
-    def _escape(self, text: str, state) -> None:
+    def _release(self, handle: str, families: list[str], state, line: int) -> None:
+        """Libere handle pour chaque famille: double liberation si c'est deja fait.
+        Un parametre libere par la fonction est note dans son resume."""
+        for family in families:
+            key = f"{family}->{handle}"
+            entry = state.get(key)
+            if entry is None:
+                if handle in self.params:
+                    self.summary["releases"].setdefault(self.params[handle], set()).add(family)
+                continue
+            if entry[0] == 0 and entry[1]:
+                self.findings.append({"kind": "double_release", "line": line, "key": key,
+                                      "acquired_line": self.taken_at.get(key)})
+            entry[0], entry[1] = 0, True
+
+    def _call_project_function(self, call, name: str, args: list[str], state, line: int) -> None:
+        summary = self.summaries.get(name)
+        for index, arg in enumerate(args):
+            handle = arg.lstrip("&")
+            if summary is None:
+                self._escape(handle, state)      # fonction inconnue: elle a pu garder le handle
+                continue
+            families = summary["releases"].get(index)
+            if families:
+                self._release(handle, sorted(families), state, line)
+            if index in summary["keeps"]:
+                self._escape(handle, state)
+        if summary is None or not summary["returns"]:
+            return
+        # Fonction qui renvoie une ressource prise: c'est une prise pour l'appelant.
+        if self._returned_directly(call):
+            self.summary["returns"].update(summary["returns"])
+            return
+        target = self._target(call, args, "return")
+        if target and target in self.locals and not self.locals[target].get("param"):
+            for family in sorted(summary["returns"]):
+                key = f"{family}->{target}"
+                state[key] = [1, False]
+                self.taken_at[key] = line
+
+    def _escape(self, text: str, state, returned: bool = False) -> None:
+        """Le handle sort du suivi: renvoye, range ailleurs ou confie a une fonction
+        inconnue. On le note dans le resume (famille renvoyee, parametre garde)."""
         for key in list(state):
-            if key.split("->", 1)[1] == text:
+            family, _sep, handle = key.partition("->")
+            if handle == text:
+                if returned:
+                    self.summary["returns"].add(family)
                 del state[key]
+        if text in self.params:
+            self.summary["keeps"].add(self.params[text])
 
     def on_return(self, node, state) -> None:
         value = node.named_children[0] if node.named_children else None
         if value is not None:
             for ident in [value, *walk(value)]:
                 if ident.type == "identifier":
-                    self._escape(text_of(self.source, ident), state)
+                    self._escape(text_of(self.source, ident), state, returned=True)
 
     def on_statement(self, node, state) -> None:
         for item in [node, *walk(node)]:
@@ -780,30 +857,117 @@ def _condition_facts(condition, source: bytes) -> list[tuple[str, dict]]:
     return [(var, {"handle": True, "status": False})] if var else []
 
 
+def _resource_summaries(nodes: list, specs: list, project_functions: set, returns: set,
+                        env: dict) -> dict[str, dict]:
+    """Resume de chaque fonction (ce qu'elle libere, garde ou renvoie).
+
+    Une fonction depend de ceux qu'elle appelle: on rejoue le calcul jusqu'a ce que les
+    resumes ne bougent plus (quatre tours au plus: la chaine d'appels qui transmet un
+    handle est courte). Une fonction absente du resultat est inconnue et ses appelants
+    la traitent comme prenant la propriete du handle."""
+    summaries: dict[str, dict] = {}
+    for _round in range(4):
+        fresh: dict[str, dict] = {}
+        for fname, node, source in nodes:
+            params = {name: index for index, name in enumerate(_param_names(node, source)) if name}
+            walker = _ResourceWalker(source, specs, _locals(node, source, env), project_functions,
+                                     returns, summaries, params)
+            walker.run(node.child_by_field_name("body"))
+            fresh[fname] = walker.summary
+        if fresh == summaries:
+            break
+        summaries = fresh
+    return summaries
+
+
 def resource_check(engine: QueryEngine, extra: list | None = None) -> dict:
     specs = RESOURCE_PAIRS + [tuple(x) for x in (extra or [])]
-    names = sorted({s[0] for s in specs})
+    names = sorted({s[0] for s in specs} | {s[1] for s in specs})
     project_functions = {r[0] for r in engine.db.execute(
         "SELECT name FROM symbols WHERE kind = 'function' AND active = 1")}
     returns = _return_macros(engine)
     env = engine.project.pp.env if getattr(engine, "project", None) else {}
+    release_of = {spec[0]: spec[1] for spec in specs}
+    # Fermetures de connexion par (fichier, fonction): un statement encore actif a
+    # ce moment est la fuite la plus courante de la bibliotheque de base de donnees.
+    disconnects: dict[tuple[str, str], list[int]] = {}
+    for r in engine.db.execute(
+        "SELECT r.enclosing, r.line, f.path FROM refs r JOIN files f ON r.file_id = f.id "
+        "WHERE r.kind = 'call' AND r.active = 1 AND r.name = 'DBDisconnect' "
+        "AND r.enclosing IS NOT NULL"
+    ):
+        disconnects.setdefault((r["path"], r["enclosing"]), []).append(r["line"])
+
+    # Toutes les fonctions du projet: une fonction qui n'appelle que fprintf est une
+    # fonction qui emprunte son parametre, et il faut le savoir pour voir la fuite apres elle.
+    by_file: dict[str, set[str]] = {}
+    for r in engine.db.execute(
+        "SELECT s.name, f.path FROM symbols s JOIN files f ON s.file_id = f.id "
+        "WHERE s.kind = 'function' AND s.active = 1 AND f.origin = 'project'"
+    ):
+        by_file.setdefault(r["path"], set()).add(r["name"])
+    nodes = []
+    for path, functions in by_file.items():
+        nodes.extend((fname, node, source, path) for fname, node, source in
+                     function_nodes(engine, path, functions))
+    project = getattr(engine, "project", None)
+    memo = project.memo if project is not None else {}
+    if "resource_summaries" not in memo:
+        memo["resource_summaries"] = _resource_summaries(
+            [n[:3] for n in nodes], specs, project_functions, returns, env)
+    summaries = memo["resource_summaries"]
+
     findings, checked = [], 0
-    for path, functions in _project_paths(engine, names).items():
-        for fname, node, source in function_nodes(engine, path, functions):
-            checked += 1
-            walker = _ResourceWalker(source, specs, _locals(node, source, env),
-                                     project_functions, returns)
-            walker.run(node.child_by_field_name("body"))
-            for item in walker.findings:
-                acquire, _sep, var = item["key"].partition("->")
-                kind = {"return_while_held": "leak_on_return", "held_at_end": "leak_at_end"}.get(
-                    item["kind"], item["kind"])
-                findings.append({
-                    "check": kind, "function": fname, "file": engine.rel(path), "line": item["line"],
-                    "resource": acquire, "variable": var, "acquired_line": item.get("acquired_line"),
-                    "confidence": "faible" if node.has_error else ("moyenne" if walker.has_goto else "haute"),
-                })
+    for fname, node, source, path in nodes:
+        if not _touches_resources(node, source, names, summaries):
+            continue
+        checked += 1
+        params = {name: index for index, name in enumerate(_param_names(node, source)) if name}
+        walker = _ResourceWalker(source, specs, _locals(node, source, env), project_functions,
+                                 returns, summaries, params)
+        walker.run(node.child_by_field_name("body"))
+        for item in walker.findings:
+            acquire, _sep, var = item["key"].partition("->")
+            kind = {"return_while_held": "leak_on_return", "held_at_end": "leak_at_end"}.get(
+                item["kind"], item["kind"])
+            findings.append({
+                "check": kind, "function": fname, "file": engine.rel(path), "line": item["line"],
+                "resource": acquire, "variable": var, "acquired_line": item.get("acquired_line"),
+                "confidence": "faible" if node.has_error else (
+                    "moyenne" if walker.has_goto else "haute"),
+                "why": _resource_why(kind, acquire, var, release_of.get(acquire), item,
+                                     disconnects.get((path, fname), [])),
+            })
     return {"functions_checked": checked, "findings": findings}
+
+
+def _touches_resources(node, source: bytes, names: list[str], summaries: dict) -> bool:
+    """La fonction appelle-t-elle une prise ou une fonction qui en renvoie une? Les
+    autres n'ont rien a rapporter (une liberation seule se note dans le resume)."""
+    producers = {name for name, summary in summaries.items() if summary["returns"]}
+    acquires = {spec for spec in names} | producers
+    body = node.child_by_field_name("body")
+    return any(c.type == "call_expression" and _callee(c, source) in acquires for c in walk(body))
+
+
+def _resource_why(kind: str, acquire: str, variable: str, release: str | None, item: dict,
+                  disconnects: list[int]) -> str:
+    """Phrase qui nomme la liberation manquante et, pour un statement de base de
+    donnees, la fermeture de connexion qui l'a laisse actif."""
+    release = release or "la liberation"
+    taken = item.get("acquired_line")
+    where = f" ligne {taken}" if taken else ""
+    if kind == "double_release":
+        return f"{variable} ({acquire}{where}) est libere deux fois par {release}"
+    text = f"{variable} ({acquire}{where}) "
+    text += ("n'est jamais libere avant la fin de la fonction" if kind == "leak_at_end"
+             else "est perdu sur ce return")
+    text += f": {release} manquant"
+    closing = [line for line in disconnects if (taken or 0) <= line <= item["line"]]
+    if acquire == "DBActivateSQL" and closing:
+        text += (f"; la connexion est fermee ligne {closing[0]} (DBDisconnect) alors que le "
+                 "statement est encore actif")
+    return text
 
 
 # ---------------------------------------------------------------- risques C -----
@@ -838,6 +1002,8 @@ def c_risks(engine: QueryEngine, checked_calls: frozenset | None = None) -> list
                                 "confidence": "haute",
                                 "why": f"code de retour de {name} ignore: un echec passe inapercu"})
             out.extend(_unchecked_alloc(body, source, local, where))
+            out.extend(_unread_return(body, source, local, where, checked_calls))
+            out.extend(_uninitialized_use(body, source, local, where))
     return out
 
 
@@ -977,19 +1143,25 @@ def _source_bytes(expr: str, local: dict, char_globals: dict) -> int | None:
 # -------------------------------------------------------------- regroupement -----
 
 def group_findings(items: list[dict]) -> list[dict]:
-    """Une alerte par tampon et par fonction pour les copies non bornees.
+    """Une alerte par fonction pour ce qui se repete.
 
     Vingt strcat vers un meme tampon de requete SQL sont un seul probleme (la
-    somme peut deborder), pas vingt. Le groupe garde la meilleure confiance de
-    ses membres, la premiere ligne et la liste des lignes (douze au plus)."""
+    somme peut deborder), pas vingt; huit codes de retour ranges dans le meme
+    resCode et jamais lus, un seul oubli d'habitude. Le groupe garde la meilleure
+    confiance de ses membres, la premiere ligne et la liste des lignes (douze
+    au plus). Un unbounded_copy se groupe par tampon, un unread_return par variable."""
     groups: dict[tuple, list[dict]] = {}
     rest: list[dict] = []
     for item in items:
-        if item["check"] != "unbounded_copy":
-            rest.append(item)
+        if item["check"] == "unbounded_copy":
+            groups.setdefault(("unbounded_copy", item["file"], item["function"], item["buffer"]),
+                              []).append(item)
+        elif item["check"] == "unread_return":
+            groups.setdefault(("unread_return", item["file"], item["function"], item["variable"]),
+                              []).append(item)
         else:
-            groups.setdefault((item["file"], item["function"], item["buffer"]), []).append(item)
-    for members in groups.values():
+            rest.append(item)
+    for key, members in groups.items():
         if len(members) == 1:
             rest.append(members[0])
             continue
@@ -1001,9 +1173,13 @@ def group_findings(items: list[dict]) -> list[dict]:
         head = {**members[0], "confidence": best["confidence"], "occurrences": len(members),
                 "lines": [m["line"] for m in members][:12], "calls": calls}
         detail = ", ".join(f"{call} x{count}" for call, count in calls.items())
-        head["why"] = (f"{len(members)} ecritures ({detail}) "
-                       f"dans {head['buffer']}[{head.get('buffer_bytes')}] sans borne: "
-                       "leur total peut depasser le tampon")
+        if key[0] == "unbounded_copy":
+            head["why"] = (f"{len(members)} ecritures ({detail}) "
+                           f"dans {head['buffer']}[{head.get('buffer_bytes')}] sans borne: "
+                           "leur total peut depasser le tampon")
+        else:
+            head["why"] = (f"{len(members)} codes de retour ({detail}) ranges dans "
+                           f"{head['variable']} puis jamais lus: les echecs passent inapercus")
         rest.append(head)
     return rest
 
@@ -1093,12 +1269,197 @@ def _unchecked_alloc(body, source, local, where) -> list[dict]:
     return out
 
 
+# ------------------------------------------- usages d'une variable locale ---------
+
+_LOOPS = ("for_statement", "while_statement", "do_statement")
+# Noeuds qu'on traverse pour retrouver la variable derriere x.champ ou (x).
+_TRANSPARENT = ("field_expression", "parenthesized_expression")
+
+
+def _is_assigned_name(node, source: bytes) -> bool:
+    """Le noeud est-il la cible d'un '=' simple, directement ou par un champ
+    (x = 1, x.champ = 1)? Un champ par '->' lit le pointeur: ce n'est pas une ecriture."""
+    while node.parent is not None and node.parent.type in _TRANSPARENT:
+        if node.parent.type == "field_expression":
+            argument = node.parent.child_by_field_name("argument")
+            if argument != node or b"->" in source[node.end_byte : node.parent.end_byte][:3]:
+                return False
+        node = node.parent
+    holder = node.parent
+    if holder is None or holder.type != "assignment_expression":
+        return False
+    left, right = holder.child_by_field_name("left"), holder.child_by_field_name("right")
+    return left == node and right is not None and \
+        source[left.end_byte : right.start_byte].strip() == b"="
+
+
+def _name_uses(body, source: bytes, name: str) -> list[tuple]:
+    """Chaque occurrence d'un identifiant local, dans l'ordre du source:
+    (noeud, nature). Natures: decl (sa declaration), write (affectation simple),
+    addr (&x: peut etre rempli par l'appele), sizeof (n'evalue rien), read."""
+    uses = []
+    for ident in walk(body):
+        if ident.type != "identifier" or text_of(source, ident) != name:
+            continue
+        parent = ident.parent
+        if parent is None:
+            continue
+        declared_here = parent.type == "init_declarator" and \
+            parent.child_by_field_name("declarator") == ident
+        if declared_here or parent.type in ("declaration", "pointer_declarator",
+                                            "array_declarator"):
+            kind = "decl"
+        elif _address_taken(ident, source):
+            kind = "addr"
+        elif _is_va_init(ident, source):
+            kind = "write"   # va_start(ap, dernier): la macro remplit ap
+        elif any(a.type == "sizeof_expression" for a in _ancestors(ident)):
+            kind = "sizeof"
+        elif _is_assigned_name(ident, source):
+            kind = "write"
+        else:
+            kind = "read"
+        uses.append((ident, kind))
+    return uses
+
+
+def _address_taken(node, source: bytes) -> bool:
+    """&x, &x.champ ou &x.a.b: l'appele peut remplir la variable."""
+    while node.parent is not None and node.parent.type in _TRANSPARENT:
+        if node.parent.type == "field_expression" and \
+                (node.parent.child_by_field_name("argument") != node
+                 or b"->" in source[node.end_byte : node.parent.end_byte][:3]):
+            return False
+        node = node.parent
+    holder = node.parent
+    return holder is not None and holder.type == "pointer_expression" and \
+        text_of(source, holder).lstrip().startswith("&")
+
+
+def _is_va_init(ident, source: bytes) -> bool:
+    """Premier argument de va_start ou va_copy: ces macros initialisent la liste."""
+    arguments = ident.parent
+    if arguments is None or arguments.type != "argument_list":
+        return False
+    call = arguments.parent
+    return call is not None and call.type == "call_expression" and \
+        _callee(call, source) in ("va_start", "va_copy") and arguments.named_children[:1] == [ident]
+
+
+def _ancestors(node):
+    node = node.parent
+    while node is not None:
+        yield node
+        node = node.parent
+
+
+def _enclosing_loop(node):
+    return next((a for a in _ancestors(node) if a.type in _LOOPS), None)
+
+
+def _unread_return(body, source, local, where, checked_calls) -> list[dict]:
+    """Code de retour range dans une variable puis jamais lu: l'echec passe inapercu
+    comme si l'appel etait ignore (resCode = DBFetchNext(h); puis rien).
+
+    Il y a deux cas. La variable n'est lue nulle part dans la fonction (haute), ou
+    elle est reaffectee avant d'etre lue (moyenne). Une affectation dans une condition
+    ou un argument est utilisee sur place: elle n'entre pas ici. Dans une boucle, une
+    lecture ailleurs dans la meme boucle suffit: elle sert a l'iteration suivante."""
+    out = []
+    for call in [n for n in walk(body) if n.type == "call_expression"]:
+        name = _callee(call, source)
+        if name not in checked_calls:
+            continue
+        holder = call.parent
+        while holder is not None and holder.type in ("cast_expression", "parenthesized_expression"):
+            holder = holder.parent
+        if holder is None:
+            continue
+        if holder.type == "assignment_expression" and holder.parent is not None \
+                and holder.parent.type == "expression_statement" \
+                and holder.child_by_field_name("left").type == "identifier":
+            target = text_of(source, holder.child_by_field_name("left")).strip()
+        elif holder.type == "init_declarator" and holder.parent is not None \
+                and holder.parent.type == "declaration":
+            target = _declared_identifier(holder.child_by_field_name("declarator"), source)
+        else:
+            continue
+        info = local.get(target)
+        if not info or info.get("param") or info.get("array"):
+            continue
+        uses = [u for u in _name_uses(body, source, target) if u[1] not in ("decl", "sizeof")]
+        later = [u for u in uses if u[0].start_byte >= call.end_byte]
+        loop = _enclosing_loop(call)
+        if any(kind in ("read", "addr") for _n, kind in uses if kind != "write" and loop is not None
+               and loop.start_byte <= _n.start_byte <= loop.end_byte):
+            continue   # relue a l'iteration suivante
+        following = next(iter(later), None)
+        if following is not None and following[1] in ("read", "addr"):
+            continue
+        never_read = not any(kind in ("read", "addr") for _n, kind in uses)
+        why = (f"code de retour de {name} range dans {target} mais {target} n'est jamais lu "
+               "dans la fonction: l'echec passe inapercu" if never_read else
+               f"code de retour de {name} range dans {target} puis ecrase avant d'avoir ete lu")
+        out.append({**where, "check": "unread_return", "line": call.start_point[0] + 1,
+                    "call": name, "variable": target,
+                    "confidence": "haute" if never_read else "moyenne", "why": why})
+    return out
+
+
+def _declared_identifier(node, source: bytes) -> str:
+    """Nom d'un declarateur (x, *x, x = 1 sans sa valeur)."""
+    return re.sub(r"[\s*&]", "", text_of(source, node).split("=")[0].split("[")[0])
+
+
+def _uninitialized_use(body, source, local, where) -> list[dict]:
+    """Variable locale declaree sans valeur et lue avant toute ecriture.
+
+    On suit l'ordre du source. Une premiere occurrence qui ecrit (x = ..., x.champ = ...)
+    ou prend l'adresse (&x: l'appele la remplit) met la variable hors de cause, y compris
+    quand l'initialisation ne couvre que certaines branches: ce cas n'est pas vu.
+    Un tableau, une variable static et un parametre sont ecartes. Une lecture dans une
+    boucle qui ecrit aussi la variable plus loin est ecartee (drapeau de premiere passe)."""
+    declared: dict[str, int] = {}
+    for decl in walk(body):
+        if decl.type != "declaration":
+            continue
+        if any(c.type == "storage_class_specifier" and text_of(source, c) in ("static", "extern")
+               for c in decl.children):
+            continue
+        for child in decl.children:
+            is_name = child.type in ("identifier", "pointer_declarator")
+            if is_name and "[" not in text_of(source, child):
+                declared[_declared_identifier(child, source)] = decl.start_point[0] + 1
+    out = []
+    for name, line in declared.items():
+        info = local.get(name)
+        if not info or info.get("param") or info.get("array"):
+            continue
+        uses = [u for u in _name_uses(body, source, name) if u[1] not in ("decl", "sizeof")]
+        if not uses or uses[0][1] != "read":
+            continue
+        first = uses[0][0]
+        loop = _enclosing_loop(first)
+        if loop is not None and any(
+                kind in ("write", "addr") and loop.start_byte <= n.start_byte <= loop.end_byte
+                for n, kind in uses):
+            continue
+        out.append({**where, "check": "uninitialized_use", "line": first.start_point[0] + 1,
+                    "variable": name, "declared_line": line, "confidence": "moyenne",
+                    "why": f"{name} declaree ligne {line} sans valeur et lue ici avant toute "
+                           "ecriture"})
+    return out
+
+
 RISK_NOTES = {
     "unbounded_copy": "copie sans borne vers un tableau local de taille fixe; les copies d'un meme "
     "tampon dans une fonction sont regroupees (occurrences, lines), group=false pour les separer",
     "format_mismatch": "arguments en nombre different des conversions du format",
     "ignored_return": "code d'erreur d'une fonction qui peut echouer jamais lu",
     "unchecked_alloc": "allocation ou ouverture utilisee avant tout test d'echec",
+    "unread_return": "code de retour range dans une variable jamais lue (ou ecrasee avant lecture)",
+    "uninitialized_use": "variable locale lue avant toute ecriture (les initialisations par "
+    "branche ne sont pas suivies)",
     "leak_on_return": "ressource acquise dans la fonction, perdue sur un return",
     "leak_at_end": "ressource acquise dans la fonction, jamais liberee ni transmise",
     "double_release": "liberation d'une ressource deja liberee sur tous les chemins",

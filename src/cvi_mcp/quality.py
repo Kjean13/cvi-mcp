@@ -2,7 +2,7 @@
 #  cvi_mcp/quality.py
 #  Role     Coherence des declarations et de l'interface avec le code
 #  Etat     stable
-#  Version  0.3.2
+#  Version  0.4.0
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -28,16 +28,50 @@ CALLBACK_ARITY = {"control": 6, "panel": 5, "menu": 4}
 _TYPE_NOISE = re.compile(r"\b(const|volatile|register|CVICALLBACK|CVIFUNC|__cdecl|__stdcall)\b")
 
 
+# Mots qui, ensemble, designent un type entier: leur ordre et leurs synonymes
+# ne comptent pas ('long long int' = 'long long', 'unsigned' = 'unsigned int').
+_INTEGER_WORDS = frozenset({"unsigned", "signed", "short", "long", "int", "char"})
+
+
+def _integer_type(words: list[str]) -> str:
+    """Nom canonique d'un type entier ecrit avec ces mots."""
+    sign = "unsigned" if "unsigned" in words else ""
+    if "char" in words:
+        return f"{sign}char" if sign or "signed" not in words else "signedchar"
+    if "short" in words:
+        return f"{sign}short"
+    if words.count("long") >= 2:
+        return f"{sign}longlong"
+    return f"{sign}long" if "long" in words else f"{sign}int"
+
+
 def _normalize_param(text: str) -> str:
-    """Type d'un parametre sans son nom: 'const char *name' -> 'char*'."""
+    """Type d'un parametre sans son nom ni ses decorations: 'const char *name' et
+    'char name[40]' donnent 'char*'; 'long long int *p' et 'long long* q' la meme chose.
+
+    Le nom se retire avant les crochets (char buf[2000]), un tableau compte comme un
+    pointeur, et les synonymes de types entiers sont ramenes a une forme unique."""
     text = _TYPE_NOISE.sub(" ", text).strip()
     if text in ("void", ""):
         return "void"
-    text = re.sub(r"\[[^\]]*\]", "*", text)
+    dimensions = len(re.findall(r"\[[^\]]*\]", text))
+    text = re.sub(r"\[[^\]]*\]", " ", text).strip()
     match = re.match(r"(.*?)([A-Za-z_]\w*)\s*$", text)
-    if match and match.group(1).strip() and not match.group(1).strip().endswith(("struct", "enum", "union")):
+    if match and match.group(1).strip() and not match.group(1).strip().endswith(
+            ("struct", "enum", "union")) and match.group(2) not in _INTEGER_WORDS:
         text = match.group(1)
-    return re.sub(r"\s+", "", text)
+    text = text.replace("*", " * ")
+    words, out, run = text.split(), [], []
+    for word in words + [""]:
+        if word in _INTEGER_WORDS:
+            run.append(word)
+            continue
+        if run:
+            out.append(_integer_type(run))
+            run = []
+        if word:
+            out.append(word)
+    return "".join(out) + "*" * dimensions
 
 
 def _params(raw: str | None) -> list[str]:
@@ -81,12 +115,21 @@ def consistency(engine: QueryEngine) -> list[dict]:
         for proto in protos:
             got = _params(proto["params"])
             if got != expected:
+                # Seule la casse differe (doubleLab* / doubleLAB*): deux alias d'un meme
+                # type compilent tres bien, ce n'est qu'un soupcon.
+                same_but_case = [g.lower() for g in got] == [e.lower() for e in expected]
+                confidence = ("haute" if len(got) != len(expected)
+                              else "faible" if same_but_case else "moyenne")
                 out.append({"check": "prototype_mismatch", "name": name, "confidence":
-                            "haute" if len(got) != len(expected) else "moyenne",
+                            confidence,
                             "file": engine.rel(proto["path"]), "line": proto["line_start"],
                             "definition": {"file": engine.rel(defs[0]["path"]), "line": defs[0]["line_start"]},
                             "prototype_params": got, "definition_params": expected,
-                            "why": "parametres du prototype differents de ceux de la definition"})
+                            "why": ("types qui ne different que par la casse: "
+                                    "deux alias du meme type?"
+                                    if same_but_case and confidence == "faible"
+                                    else "parametres du prototype differents de ceux "
+                                         "de la definition")})
 
     # Prototype du projet sans definition: appel vers une fonction absente du build.
     called = {r[0] for r in db.execute("SELECT DISTINCT name FROM refs WHERE kind = 'call' AND active = 1")}

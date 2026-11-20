@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cvi-mcp"
-version = "0.3.3"
+version = "0.4.0"
 description = "Serveur MCP en lecture seule pour projets LabWindows/CVI"
 readme = "README.md"
 license = { text = "MIT" }

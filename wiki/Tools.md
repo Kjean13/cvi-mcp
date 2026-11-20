@@ -4,7 +4,7 @@ Tools
 Back to [Home](Home) to install and connect, or [Internals](Internals) for
 how the index is built. En francais: [Outils](Tools-fr).
 
-Thirty-eight tools, all read-only. Every call is written to the audit log. The
+Forty tools, all read-only. Every call is written to the audit log. The
 index is refreshed before each call, incrementally: nothing to launch by hand.
 
 Conventions that hold everywhere:
@@ -96,8 +96,9 @@ Quality and risks
 |---|---|
 | `dead_code(section)` | functions unreachable from entry points (`never_called`, `only_called_by_dead_code`, `only_used_in_excluded_code`), unwired callbacks, globals unused or write-only, macros, panels (`never_loaded`, `only_in_excluded_code`, `indirect_load_possible` with evidence) |
 | `lock_check(kind)` | locks followed path by path on compiled code; wrapper functions, lock order inversions, blocking calls while held |
-| `risks(check, file, min_confidence, group)` | `unbounded_copy`, `format_mismatch`, `ignored_return`, `unchecked_alloc`, `leak_on_return`, `leak_at_end`, `double_release`, `ui_from_thread`, `shared_global_unlocked`, `inconsistent_lock`, `ui_control_unlocked`. `group` (default true) folds the unbounded copies into one buffer of one function into a single finding (`occurrences`, `lines`, `calls`); `group=false` lists each call |
-| `consistency(check)` | `duplicate_definition`, `prototype_mismatch`, `declared_not_defined`, `could_be_static`, `extern_mismatch`, `callback_signature`, `control_on_wrong_panel` |
+| `risks(check, file, min_confidence, group)` | `leak_on_return`, `double_release`, `leak_at_end`, `unchecked_alloc`, `uninitialized_use`, `unread_return`, `ignored_return`, `lock_gap`, `inconsistent_lock`, `ui_control_unlocked`, `ui_from_thread`, `unbounded_copy`, `format_mismatch`, `shared_global_unlocked`. Findings come by confidence, then in that order of gravity, so a cut keeps the worst. `unread_return` is a return code stored in a variable and never read; `uninitialized_use` a local read before any write; `lock_gap` a global that several functions protect with the same lock and one access does not. `group` (default true) folds the repeats of one function (copies into one buffer, return codes into one variable) into a single finding (`occurrences`, `lines`, `calls`); `group=false` lists each. A resource handle is followed through the project's functions (released, kept, merely used, or returned by a wrapper), and an unknown `check` is an error |
+| `consistency(check)` | `duplicate_definition`, `prototype_mismatch` (parameter names ignored, `long long` equal to `long long int`, a case-only difference is `faible`), `declared_not_defined`, `could_be_static`, `extern_mismatch`, `callback_signature`, `control_on_wrong_panel` |
+| `review(limit, min_confidence, file)` | one call, one sorted report: findings of `risks`, `threads`, `lock_check` and `consistency` in four sections (crashes and leaks, threads and locks, ignored errors, consistency), each with its count per check and its `limit` worst items, then dead-code counts and what was not reviewed. Each section names the tool that gives the detail |
 | `complexity(sort, file, min_risk, section)` | lines, cyclomatic, cognitive, depth, params, locals, stack; `section`: `by_file` or `duplicates` (functions copied from one model) |
 | `module_graph(file, format)` | file dependencies, cycles, mutual pairs with the lightest edge to cut; `format`: `json`, `mermaid`, `dot` |
 | `threads(global_name)` | execution contexts (UI, thread pool, async timers), what each reaches, UI timers, shared globals with their unprotected accesses (`unprotected_accesses`) and locks that do not agree (`conflicting_locks`); with `global_name`, who writes and reads it from where, and on which lines no lock is held |
@@ -126,4 +127,5 @@ Versions
 |---|---|
 | `snapshot_save(label)`, `snapshot_list()`, `snapshot_delete(label)` | named states of the index |
 | `diff_versions(before, after, path, files)` | `headline` in a few sentences, then added, removed, moved, signature, value and body changes, symbols switched between compiled and excluded, UI constants and INI keys added or removed, calls. Sides: a snapshot, `current` or `path:<folder>` (another version or variant). `files` restricts both sides |
+| `change_impact(before, after, path, files, limit)` | what a change between two versions may break, from the same sides as `diff_versions`: the changed functions ranked to read first (callers to review, signature changes, in a thread, takes a lock, `risks` alerts when `after` is `current`), calls broken by a removed function that is still called, and changed macros with what they size |
 | `history(target)` | git history when the project is a repository: commits on a function's lines, on a file, or the latest ones (at most 15 files listed per commit, `files_total` gives the rest) |

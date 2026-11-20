@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-3776ab" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6e7681" alt="Windows and Linux">
   <img src="https://img.shields.io/badge/MCP-stdio-8b5cf6" alt="MCP over stdio">
-  <img src="https://img.shields.io/badge/tools-38-30363d" alt="38 tools">
+  <img src="https://img.shields.io/badge/tools-40-30363d" alt="40 tools">
 </p>
 
 <p align="center">
@@ -71,10 +71,10 @@ Tools
 | Search and impact | `search_text`, `find_by_topic`, `related`, `series`, `impact`, `peek` |
 | Build configuration | `config_map`, `macro_usages`, `config_diff` |
 | User interface | `ui_map` |
-| Quality and risks | `dead_code`, `lock_check`, `risks`, `consistency`, `complexity`, `module_graph`, `threads` |
+| Quality and risks | `review`, `dead_code`, `lock_check`, `risks`, `consistency`, `complexity`, `module_graph`, `threads` |
 | I/O and persistence | `call_sites`, `persistence` |
 | SDK and build | `sdk_index`, `sdk_lookup`, `build_check` |
-| Versions | `snapshot_save`, `snapshot_list`, `snapshot_delete`, `diff_versions`, `history` |
+| Versions | `snapshot_save`, `snapshot_list`, `snapshot_delete`, `diff_versions`, `change_impact`, `history` |
 
 Every answer is about the code that is actually compiled: `#if` are evaluated
 with the `.prj` defines and build configuration, and excluded code is set
@@ -109,7 +109,7 @@ Three pages per language, no more.
 | Page | English | Français |
 |---|---|---|
 | Install, connect, configure | [Home](../../wiki/Home) | [Accueil](../../wiki/Home-fr) |
-| The 38 tools | [Tools](../../wiki/Tools) | [Outils](../../wiki/Tools-fr) |
+| The 40 tools | [Tools](../../wiki/Tools) | [Outils](../../wiki/Tools-fr) |
 | Design, limits, troubleshooting | [Internals](../../wiki/Internals) | [Fonctionnement](../../wiki/Internals-fr) |
 
 The wiki sources live in `wiki/`. To publish them:

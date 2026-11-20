@@ -2,7 +2,7 @@
 #  cvi_mcp/server.py
 #  Role     Serveur MCP: exposition des outils de lecture du projet CVI
 #  Etat     stable
-#  Version  0.3.3
+#  Version  0.4.0
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -26,6 +26,7 @@ from . import build as buildmod
 from . import gitinfo as gitmod
 from . import project as projectmod
 from . import quality as qualitymod
+from . import review as reviewmod
 from . import risks as riskmod
 from . import threads as threadmod
 from .audit import AuditLog
@@ -1185,27 +1186,48 @@ def lock_check(kind: str | None = None, limit: int = 30, offset: int = 0) -> str
 _CONFIDENCE_RANK = riskmod.CONFIDENCE_RANK
 
 
+def _risk_items(engine: QueryEngine, cfg: Config, group: bool = True) -> list[dict]:
+    """Toutes les alertes de risks: risques C, ressources, threads et verrous. Commun a
+    risks, review et change_impact pour qu'ils parlent des memes constats."""
+    # Quelques secondes de calcul: gardees avec le projet (project.memo), qui est remplace
+    # des qu'un fichier ou un reglage change. Les reglages (resource_pairs, checked_calls)
+    # font partie de l'empreinte du projet, donc d'un autre jeu de reglages sort un autre calcul.
+    project = getattr(engine, "project", None)
+    memo = project.memo if project is not None else {}
+    key = ("risk_items", group)
+    if key in memo:
+        return list(memo[key])
+    extra = cfg.settings.get("resource_pairs") or []
+    checked = cfg.settings.get("checked_calls")
+    items = riskmod.c_risks(engine, frozenset(checked) | riskmod.CHECKED_CALLS if checked else None)
+    if group:
+        items = riskmod.group_findings(items)
+    items += riskmod.resource_check(engine, extra)["findings"]
+    items += threadmod.thread_risks(engine)
+    memo[key] = items
+    return list(items)
+
+
 @mcp.tool()
 def risks(check: str | None = None, file: str | None = None, min_confidence: str = "moyenne",
           limit: int = 30, offset: int = 0, group: bool = True) -> str:
     """Risques C classiques et fuites, sur le code compile, positions et
     explication seulement. check: unbounded_copy, format_mismatch,
-    ignored_return, unchecked_alloc, leak_on_return, leak_at_end,
-    double_release, ui_from_thread, shared_global_unlocked. min_confidence:
+    ignored_return, unread_return, uninitialized_use, unchecked_alloc,
+    leak_on_return, leak_at_end, double_release, ui_from_thread,
+    shared_global_unlocked, inconsistent_lock, ui_control_unlocked. Les
+    alertes sont classees par confiance puis par gravite. min_confidence:
     haute, moyenne (defaut) ou faible. group (defaut vrai): les copies non
     bornees d'un meme tampon dans une fonction forment une seule alerte
     (occurrences, lines); group=false les detaille. Paires de ressources
     supplementaires: "resource_pairs" dans .cvi-mcp.json ([["Ouvre", "Ferme", "return"]])."""
+    if check and check not in riskmod.CHECKS:
+        return _reply("risks", {"check": check},
+                      {"error": f"check inconnu: '{check}'", "checks": list(riskmod.CHECKS)})
     cfg = _cfg()
     engine = _engine(cfg)
     try:
-        extra = cfg.settings.get("resource_pairs") or []
-        checked = cfg.settings.get("checked_calls")
-        items = riskmod.c_risks(engine, frozenset(checked) | riskmod.CHECKED_CALLS if checked else None)
-        if group:
-            items = riskmod.group_findings(items)
-        items += riskmod.resource_check(engine, extra)["findings"]
-        items += threadmod.thread_risks(engine)
+        items = _risk_items(engine, cfg, group)
         if file:
             ids = engine.match_files(file)
             marks = ",".join("?" * len(ids))
@@ -1227,7 +1249,12 @@ def risks(check: str | None = None, file: str | None = None, min_confidence: str
             entry["occurrences"] = entry.get("occurrences", 0) + item["occurrences"]
     if check:
         items = [i for i in items if i["check"] == check]
-    items.sort(key=lambda i: (_CONFIDENCE_RANK.get(i["confidence"], 2), i["check"], i["file"], i["line"]))
+    # Confiance d'abord, puis gravite du risque: la coupe du budget ne retire que le moins grave.
+    items.sort(key=lambda i: (_CONFIDENCE_RANK.get(i["confidence"], 2),
+                              riskmod.CHECK_RANK.get(i["check"], len(riskmod.CHECKS)),
+                              i["file"], i["line"]))
+    unknown = len(riskmod.CHECKS)
+    counts = dict(sorted(counts.items(), key=lambda kv: riskmod.CHECK_RANK.get(kv[0], unknown)))
     by_file: dict[str, int] = {}
     for item in items:
         by_file[item["file"]] = by_file.get(item["file"], 0) + 1
@@ -1241,6 +1268,41 @@ def risks(check: str | None = None, file: str | None = None, min_confidence: str
     args = {"check": check, "file": file, "min_confidence": min_confidence, "limit": limit,
             "offset": offset, "group": group}
     return _reply("risks", args, payload)
+
+
+@mcp.tool()
+def review(limit: int = 8, min_confidence: str = "moyenne", file: str | None = None) -> str:
+    """Rapport de revue en un appel: les constats de risks, threads, verrous et coherence,
+    regroupes en sections (plantages et fuites, threads et verrous, erreurs ignorees,
+    coherence), classes par confiance puis par gravite, avec pour chacune le compte par
+    type et les `limit` plus graves. Le code mort et les constats de style ne sont que
+    comptes. Chaque section dit quel outil donne le detail. min_confidence: haute,
+    moyenne (defaut) ou faible. file restreint a un fichier ou un dossier."""
+    cfg = _cfg()
+    engine = _engine(cfg)
+    try:
+        items = _risk_items(engine, cfg, group=True)
+        items += reviewmod.blocking_items(analysis.lock_check(engine)["blocking_calls_while_held"])
+        found = qualitymod.consistency(engine)
+        items += reviewmod.consistency_items(found)
+        quiet = {name: sum(1 for c in found if c["check"] == name) for name in reviewmod._QUIET}
+        mapper = UiMap(engine)
+        panels = sorted(mapper.uir["panels"]) if mapper.uir else []
+        dead = analysis.dead_code(engine, mapper.uir, panels)
+        if file:
+            ids = engine.match_files(file)
+            marks = ",".join("?" * len(ids))
+            wanted = {engine.rel(r["path"]) for r in engine.db.execute(
+                f"SELECT path FROM files WHERE id IN ({marks})", ids)} if ids else set()
+            items = [i for i in items if i.get("file") in wanted]
+    finally:
+        engine.close()
+    payload = reviewmod.build_review(
+        items, limit, min_confidence,
+        dead={name: len(dead.get(name, [])) for name in ("functions", "callbacks", "globals")},
+        quiet=quiet)
+    args = {"limit": limit, "min_confidence": min_confidence, "file": file}
+    return _reply("review", args, payload)
 
 
 @mcp.tool()
@@ -1585,6 +1647,38 @@ def snapshot_delete(label: str) -> str:
     return _reply("snapshot_delete", {"label": label}, payload)
 
 
+def _version_states(cfg: Config, before: str, after: str) -> tuple[dict, dict | None]:
+    """Etats des deux versions a comparer: un instantane, 'current' (index vivant) ou
+    'path:<dossier>'. Renvoie (etats par etiquette, None) ou ({}, erreur a repondre)."""
+    states: dict[str, dict] = {}
+    labels = [before, after]
+    if any(not label.startswith("path:") for label in labels):
+        engine = _engine(cfg)
+        try:
+            for label in labels:
+                if label.startswith("path:") or label in states:
+                    continue
+                if label == diffs.CURRENT:
+                    states[label] = diffs.capture_state(engine.db, engine.root)
+                    continue
+                loaded = diffs.load_snapshot(engine.db, label)
+                if loaded is None:
+                    known = [s["label"] for s in diffs.list_snapshots(engine.db)]
+                    return {}, {"error": f"instantane '{label}' introuvable", "available": known}
+                states[label] = loaded
+        finally:
+            engine.close()
+    for label in labels:
+        if label.startswith("path:") and label not in states:
+            folder = Path(label[5:])
+            if not folder.is_absolute():
+                folder = (cfg.project_path / folder).resolve()
+            if not folder.is_dir():
+                return {}, {"error": f"dossier '{folder}' introuvable"}
+            states[label] = diffs.state_of_path(folder, lambda p: cfg.is_excluded(Path(p).name))
+    return states, None
+
+
 @mcp.tool()
 def diff_versions(before: str, after: str = diffs.CURRENT, path: str | None = None,
                   files: str | None = None) -> str:
@@ -1600,34 +1694,9 @@ def diff_versions(before: str, after: str = diffs.CURRENT, path: str | None = No
     args = {"before": before, "after": after, "path": path, "files": files}
     if path:
         after = f"path:{path}"
-
-    states: dict[str, dict] = {}
-    labels = [before, after]
-    if any(not label.startswith("path:") for label in labels):
-        engine = _engine(cfg)
-        try:
-            for label in labels:
-                if label.startswith("path:") or label in states:
-                    continue
-                if label == diffs.CURRENT:
-                    states[label] = diffs.capture_state(engine.db, engine.root)
-                    continue
-                loaded = diffs.load_snapshot(engine.db, label)
-                if loaded is None:
-                    known = [s["label"] for s in diffs.list_snapshots(engine.db)]
-                    return _reply("diff_versions", args,
-                                  {"error": f"instantane '{label}' introuvable", "available": known})
-                states[label] = loaded
-        finally:
-            engine.close()
-    for label in labels:
-        if label.startswith("path:") and label not in states:
-            folder = Path(label[5:])
-            if not folder.is_absolute():
-                folder = (cfg.project_path / folder).resolve()
-            if not folder.is_dir():
-                return _reply("diff_versions", args, {"error": f"dossier '{folder}' introuvable"})
-            states[label] = diffs.state_of_path(folder, lambda p: cfg.is_excluded(Path(p).name))
+    states, error = _version_states(cfg, before, after)
+    if error:
+        return _reply("diff_versions", args, error)
 
     payload = diffs.compare(diffs.restrict(states[before], files), diffs.restrict(states[after], files),
                             before, after)
@@ -1636,6 +1705,52 @@ def diff_versions(before: str, after: str = diffs.CURRENT, path: str | None = No
         if isinstance(payload.get(key), list) and len(payload[key]) > 100:
             payload[key] = page(payload[key], 0, 100)
     return _reply("diff_versions", args, payload)
+
+
+@mcp.tool()
+def change_impact(before: str, after: str = diffs.CURRENT, path: str | None = None,
+                  files: str | None = None, limit: int = 15) -> str:
+    """Ce qu'un changement entre deux versions risque de casser. Part de diff_versions
+    (memes cotes: instantane, 'current', 'path:<dossier>', path, files) et classe les
+    fonctions modifiees a relire d'abord: appelants a revoir, appels casses (fonction
+    retiree encore appelee), macros changees avec ce qu'elles dimensionnent. Quand after est
+    'current' elle ajoute les contextes d'execution (thread), la prise de verrous et les
+    alertes de risks de chaque fonction modifiee."""
+    cfg = _cfg()
+    args = {"before": before, "after": after, "path": path, "files": files, "limit": limit}
+    if path:
+        after = f"path:{path}"
+    states, error = _version_states(cfg, before, after)
+    if error:
+        return _reply("change_impact", args, error)
+    report = diffs.compare(diffs.restrict(states[before], files),
+                           diffs.restrict(states[after], files), before, after)
+    live: dict = {}
+    if after == diffs.CURRENT:
+        engine = _engine(cfg)
+        try:
+            where, entries = threadmod.contexts(engine)
+            live["contexts"] = {fn: sorted(labels) for fn, labels in where.items()}
+            live["locking"] = threadmod._locking_functions(engine)
+            by_function: dict[str, list] = {}
+            for item in _risk_items(engine, cfg, group=True):
+                brief = {key: item[key] for key in ("check", "line", "confidence", "why")
+                         if key in item}
+                by_function.setdefault(item["function"], []).append(brief)
+            live["risks"] = {fn: sorted(v, key=lambda a: (_CONFIDENCE_RANK.get(a["confidence"], 2),
+                                                          riskmod.CHECK_RANK.get(a["check"], 99)))
+                             for fn, v in by_function.items()}
+            live["macros"] = {}
+            for item in report.get("value_changed", []):
+                if item["kind"] == "macro":
+                    summary = insight.impact(engine, cfg, item["name"], 1).get("macro", {})
+                    live["macros"][item["name"]] = {
+                        "arrays_resized": summary.get("arrays_dimensioned", 0),
+                        "functions_using": summary.get("functions_using", 0)}
+        finally:
+            engine.close()
+    return _reply("change_impact", args, diffs.change_impact(report, states[before], states[after],
+                                                              live, limit))
 
 
 @mcp.tool()

@@ -2,7 +2,7 @@
 #  cvi_mcp/diffs.py
 #  Role     Instantanes nommes de l'index et comparaison entre deux versions
 #  Etat     stable
-#  Version  0.3.3
+#  Version  0.4.0
 # ==============================================================================
 
 # ============================ Standard ========================================
@@ -376,6 +376,113 @@ def _headline(added, removed, values, signatures, bodies, activation, ui_added, 
     if files_added or files_removed:
         lines.append(f"fichiers: {len(files_added)} ajoute(s), {len(files_removed)} supprime(s)")
     return lines or ["aucune difference"]
+
+
+# ----------------------------------------------------------- impact d'un changement -
+
+# Poids d'une fonction modifiee dans le classement "a relire d'abord".
+_WEIGHTS = {"thread": 5, "lock": 3, "risk": 4, "signature": 3, "caller": 0.5}
+
+
+def change_impact(report: dict, before: dict, after: dict, live: dict | None = None,
+                  limit: int = 15) -> dict:
+    """Ce qu'un changement risque de casser, a partir de la comparaison de deux etats.
+
+    report est la sortie de compare. Pour chaque fonction ajoutee, retiree, dont le corps ou
+    la signature change, ou qui passe de compile a exclu: ses appelants dans la nouvelle
+    version (aretes d'appel de l'etat), et, si live le donne, les contextes d'execution, la
+    prise de verrous et les alertes de risks qui la visent. Une fonction retiree que
+    quelqu'un appelle encore est un appel casse. Une macro dont la valeur change est
+    rapportee avec ce qu'elle dimensionne (live).
+
+    live (version vivante seulement): {"contexts": {fonction: [contextes]}, "locking": {fonctions},
+    "risks": {fonction: [alertes]}, "macros": {macro: {"arrays_resized", "functions_using"}}}."""
+    live = live or {}
+    callers: dict[str, set[str]] = {}
+    for caller, callee in after["edges"]:
+        callers.setdefault(callee, set()).add(caller)
+    still_defined = {name for (kind, name, _file) in after["symbols"] if kind == "function"}
+
+    changes: dict[str, dict] = {}
+
+    def note(name: str, file: str, change: str, **extra) -> None:
+        entry = changes.setdefault(name, {"name": name, "file": file, "change": [], **extra})
+        if change not in entry["change"]:
+            entry["change"].append(change)
+        entry.update(extra)
+
+    for item in report.get("added", []):
+        if item["kind"] == "function":
+            note(item["name"], item["file"], "added")
+    for item in report.get("body_changed", []):
+        if item["kind"] == "function":
+            note(item["name"], item["file"], "body")
+    for item in report.get("signature_changed", []):
+        if item["kind"] == "function":
+            note(item["name"], item["file"], "signature",
+                 signature_before=item["before"], signature_after=item["after"])
+    for item in report.get("activation_changed", []):
+        if item["kind"] == "function":
+            note(item["name"], item["file"], "compiled" if item["now"] == "compile" else "excluded")
+    removed = [i for i in report.get("removed", []) if i["kind"] == "function"]
+
+    functions = []
+    for name, entry in changes.items():
+        who = sorted(callers.get(name, set()) - {name})
+        entry["callers_total"] = len(who)
+        entry["callers"] = who[:8]
+        contexts = [c for c in live.get("contexts", {}).get(name, []) if c != "ui"]
+        if contexts:
+            entry["thread_contexts"] = contexts
+        if name in live.get("locking", ()):
+            entry["takes_lock"] = True
+        alerts = live.get("risks", {}).get(name, [])
+        if alerts:
+            entry["risks"] = alerts[:5]
+        entry["score"] = round(
+            _WEIGHTS["thread"] * bool(contexts) + _WEIGHTS["lock"] * bool(entry.get("takes_lock"))
+            + _WEIGHTS["risk"] * min(len(alerts), 3)
+            + _WEIGHTS["signature"] * ("signature" in entry["change"])
+            + _WEIGHTS["caller"] * min(len(who), 20), 1)
+        functions.append(entry)
+    functions.sort(key=lambda e: (-e["score"], e["name"]))
+
+    # Retiree mais encore appelee: l'edition de liens echouera (ou un appel est devenu faux).
+    broken = [{"function": i["name"], "file": i["file"], "callers": sorted(callers[i["name"]])[:8]}
+              for i in removed if callers.get(i["name"]) and i["name"] not in still_defined]
+
+    macros = []
+    for item in report.get("value_changed", []):
+        if item["kind"] == "macro":
+            macros.append({"name": item["name"], "file": item["file"], "before": item["before"],
+                           "after": item["after"], **live.get("macros", {}).get(item["name"], {})})
+
+    review_first = [f["name"] for f in functions if f["score"] > 0][:5]
+    summary = {
+        "functions_changed": len(functions), "functions_removed": len(removed),
+        "broken_calls": len(broken), "macros_changed": len(macros),
+        "callers_to_review": len({c for f in functions for c in callers.get(f["name"], ())}),
+        "in_threads": sum(1 for f in functions if f.get("thread_contexts")),
+        "with_alerts": sum(1 for f in functions if f.get("risks")),
+    }
+    headline = []
+    if broken:
+        headline.append(f"{len(broken)} fonction(s) retiree(s) encore appelee(s)")
+    if summary["in_threads"]:
+        headline.append(f"{summary['in_threads']} fonction(s) modifiee(s) tournent dans un thread")
+    if summary["with_alerts"]:
+        headline.append(
+            f"{summary['with_alerts']} fonction(s) modifiee(s) ont des alertes de risks")
+    if macros:
+        names = ", ".join(m["name"] for m in macros[:4])
+        headline.append(f"{len(macros)} macro(s) changee(s): {names}")
+    if not headline:
+        headline.append(
+            "aucun risque notable releve" if functions or removed else "aucune difference")
+    return {"from": report["from"], "to": report["to"], "live": bool(live), "headline": headline,
+            "summary": summary, "review_first": review_first, "broken_calls": broken[:limit],
+            "functions": functions[:limit], "functions_total": len(functions),
+            "macros": macros[:limit]}
 
 
 def state_of_path(root: Path, is_excluded=None) -> dict:

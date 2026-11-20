@@ -725,3 +725,495 @@ def test_lock_map_is_kept_with_the_project_and_dropped_with_it(locked):
         assert risks.lock_map(engine) is not first                # fichier modifie: carte neuve
     finally:
         engine.close()
+
+
+# --------------------------------------------- normalisation des prototypes --
+
+@pytest.mark.parametrize("left, right", [
+    # le nom ne compte pas, le tableau est un pointeur
+    ("char strQuery[2000]", "char strSqlInsert[2000]"),
+    ("char strQuery[2000]", "char *other"),
+    ("long long *a", "long long int *b"),                    # synonymes d'entiers
+    ("unsigned x", "unsigned int y"),
+    ("const char *s", "char s2[]"),
+    ("short int n", "short m"),
+    ("long int n", "long m"),
+])
+def test_equivalent_parameters_normalize_alike(left, right):
+    from cvi_mcp import quality
+    assert quality._normalize_param(left) == quality._normalize_param(right)
+
+
+@pytest.mark.parametrize("left, right", [
+    ("int *a", "int a"),
+    ("long long a", "long a"),
+    ("unsigned char a", "char a"),
+    ("double a", "float a"),
+    ("char *a", "char **b"),
+    ("struct Tag *p", "struct Other *p"),
+])
+def test_different_parameters_stay_different(left, right):
+    from cvi_mcp import quality
+    assert quality._normalize_param(left) != quality._normalize_param(right)
+
+
+def test_prototype_mismatch_confidence_tiers(sample):
+    _append_c(sample, """
+int ProtoA(long long int *p);
+int ProtoA(long long *q) { return 0; }
+int ProtoB(doubleLab *p);
+int ProtoB(doubleLAB *p) { return 0; }
+int ProtoC(int a, int b);
+int ProtoC(int a) { return 0; }
+int ProtoD(int a);
+int ProtoD(double a) { return 0; }
+""")
+    found = {i["name"]: i for i in call(server.consistency, check="prototype_mismatch",
+                                        limit=100)["findings"]["items"]}
+    assert "ProtoA" not in found                       # synonymes: pas de faux positif
+    assert found["ProtoB"]["confidence"] == "faible"   # casse seule
+    assert found["ProtoC"]["confidence"] == "haute"    # nombre different
+    assert found["ProtoD"]["confidence"] == "moyenne"  # type different
+
+
+# --------------------------------------- codes de retour et variables sans valeur --
+
+RETURN_AND_INIT_C = """
+static int NeverRead(void)
+{
+    int rc;
+    rc = DBFetchNext(1);                 /* rc n'est lu nulle part */
+    return 0;
+}
+static int Overwritten(void)
+{
+    int rc;
+    rc = DBFetchNext(1);                 /* ecrase avant lecture */
+    rc = DBFetchNext(2);
+    if (rc != 0) return -1;
+    return 0;
+}
+static int ReadLater(void)
+{
+    int rc = DBFetchNext(1);
+    if (rc) return -1;
+    int rc2;
+    rc2 = DBFetchNext(3);
+    return rc2;
+}
+static int InCondition(void)
+{
+    int rc;
+    if ((rc = DBFetchNext(1)) != 0) return -1;      /* utilise sur place */
+    return 0;
+}
+static int InLoop(void)
+{
+    int rc = 0;
+    int i;
+    for (i = 0; i < 3; i++) {
+        if (rc) break;                    /* lu a l'iteration suivante */
+        rc = DBFetchNext(i);
+    }
+    return 0;
+}
+static int Uninit(void)
+{
+    int a;
+    int b;
+    int c;
+    int d;
+    int e;
+    b = 1;
+    a = b + c;                            /* c lue sans valeur */
+    scanf("%d", &d);                      /* &d: rempli par l'appele */
+    e = d;
+    return a + e;
+}
+static void UninitPointer(void)
+{
+    char *p;
+    strcpy(p, "x");                       /* p lu sans valeur */
+}
+static int FieldFirst(void)
+{
+    Other box;
+    box.count = 1;                        /* premiere occurrence: ecriture */
+    return box.count;
+}
+"""
+
+
+def _findings_of(items, check):
+    return {(i["function"], i.get("variable")): i for i in items if i["check"] == check}
+
+
+def test_unread_return_code(sample):
+    _append_c(sample, RETURN_AND_INIT_C)
+    _data, items = _risks(file="main.c")
+    unread = _findings_of(items, "unread_return")
+    assert set(unread) == {("NeverRead", "rc"), ("Overwritten", "rc")}
+    assert unread[("NeverRead", "rc")]["confidence"] == "haute"
+    assert unread[("Overwritten", "rc")]["confidence"] == "moyenne"
+    assert unread[("NeverRead", "rc")]["call"] == "DBFetchNext"
+
+
+def test_uninitialized_use(sample):
+    _append_c(sample, RETURN_AND_INIT_C)
+    _data, items = _risks(file="main.c")
+    found = _findings_of(items, "uninitialized_use")
+    assert ("Uninit", "c") in found and ("UninitPointer", "p") in found
+    assert not any(function == "Uninit" and name in ("a", "b", "d", "e")
+                   for function, name in found)
+    assert not any(function == "FieldFirst" for function, _name in found)
+    assert found[("Uninit", "c")]["declared_line"] < found[("Uninit", "c")]["line"]
+
+
+UNINIT_TRAPS_C = """
+#include <stdarg.h>
+static void PointerTable(void)
+{
+    char *names[8];
+    int i;
+    for (i = 0; i < 8; i++)
+        names[i] = 0;                     /* tableau de pointeurs rempli par element */
+}
+static int Variadic(char *first, ...)
+{
+    va_list ap;
+    va_start(ap, first);                  /* la macro initialise ap */
+    return 0;
+}
+static void FieldAddress(void)
+{
+    Stamp when;
+    sscanf("12:30", "%d:%d", &when.hour, &when.min);   /* adresse d'un champ */
+}
+static void TwoCodes(void)
+{
+    int rc;
+    rc = DBFetchNext(1);
+    rc = DBFetchNext(2);
+    rc = DBFetchNext(3);
+}
+"""
+
+
+def test_uninitialized_use_ignores_initialisers_it_cannot_see(sample):
+    _append_c(sample, UNINIT_TRAPS_C)
+    _data, items = _risks(file="main.c")
+    assert not [i for i in items if i["check"] == "uninitialized_use"
+                and i["function"] in ("PointerTable", "Variadic", "FieldAddress")]
+
+
+def test_unread_returns_are_grouped_per_variable(sample):
+    _append_c(sample, UNINIT_TRAPS_C)
+    _data, items = _risks(file="main.c")
+    grouped = [i for i in items if i["check"] == "unread_return" and i["function"] == "TwoCodes"]
+    assert len(grouped) == 1 and grouped[0]["occurrences"] == 3 and len(grouped[0]["lines"]) == 3
+    _data, raw = _risks(file="main.c", group=False)
+    detail = [i for i in raw if i["check"] == "unread_return" and i["function"] == "TwoCodes"]
+    assert len(detail) == 3
+
+
+DB_LEAK_C = """
+static int StatementLeft(void)
+{
+    int conn, stmt;
+    conn = DBConnect("dsn");
+    stmt = DBActivateSQL(conn, "select 1");
+    DBFetchNext(stmt);
+    DBDisconnect(conn);                  /* stmt encore actif */
+    return 0;
+}
+static int StatementClosed(void)
+{
+    int conn, stmt;
+    conn = DBConnect("dsn");
+    stmt = DBActivateSQL(conn, "select 1");
+    DBDeactivateSQL(stmt);
+    DBDisconnect(conn);
+    return 0;
+}
+"""
+
+
+def test_database_statement_leak_names_the_missing_release(sample):
+    _append_c(sample, DB_LEAK_C)
+    _data, items = _risks(file="main.c")
+    leaks = [i for i in items if i["check"] in ("leak_on_return", "leak_at_end")
+             and i["resource"] == "DBActivateSQL"]
+    assert [i["function"] for i in leaks] == ["StatementLeft"]
+    assert "DBDeactivateSQL manquant" in leaks[0]["why"]
+    assert "DBDisconnect" in leaks[0]["why"] and "statement est encore actif" in leaks[0]["why"]
+
+
+def test_risks_are_ordered_by_severity_and_validate_check(sample):
+    from cvi_mcp import risks
+    _append_c(sample, DB_LEAK_C + RETURN_AND_INIT_C)
+    data = call(server.risks, min_confidence="faible", limit=500)
+    items = data["findings"]["items"]
+    ranks = [(server._CONFIDENCE_RANK[i["confidence"]], risks.CHECK_RANK[i["check"]])
+             for i in items]
+    assert ranks == sorted(ranks)                                 # confiance, puis gravite
+    order = list(data["counts"])
+    assert order == sorted(order, key=lambda name: risks.CHECK_RANK[name])
+    unknown = call(server.risks, check="nonsense")
+    assert "error" in unknown and unknown["checks"] == list(risks.CHECKS)
+
+
+# ------------------------------------------ ressources entre fonctions --
+
+RESOURCE_FLOW_C = """
+FILE *gKept;
+static FILE *OpenLog(const char *name)
+{
+    FILE *f = fopen(name, "w");
+    return f;                              /* produit un fopen */
+}
+static void CloseLog(FILE *f) { fclose(f); }              /* libere son parametre 0 */
+static void CloseTwice(FILE *f) { CloseLog(f); }          /* transmet la liberation */
+static void WriteLog(FILE *f) { fprintf(f, "x"); }        /* emprunte seulement */
+static void KeepLog(FILE *f) { WriteLog(f); gKept = f; }  /* garde le handle */
+static FILE *Forward(void) { return OpenLog("a"); }       /* renvoie un producteur */
+
+static int Closes(void)    { FILE *f = OpenLog("a"); WriteLog(f); CloseLog(f); return 0; }
+static int ClosesDeep(void){ FILE *f = OpenLog("a"); CloseTwice(f); return 0; }
+static int Leaks(void)     { FILE *f = OpenLog("a"); WriteLog(f); return 0; }
+static int LeaksForward(void) { FILE *f = Forward(); WriteLog(f); return 0; }
+static int Hands(void)     { FILE *f = OpenLog("a"); KeepLog(f); return 0; }
+static int Unknown(void)   { FILE *f = OpenLog("a"); VendorUse(f); return 0; }
+"""
+
+
+def test_resources_followed_across_functions(sample):
+    _append_c(sample, RESOURCE_FLOW_C)
+    _data, items = _risks(file="main.c")
+    ours = {"Closes", "ClosesDeep", "Leaks", "LeaksForward", "Hands", "Unknown"}
+    leaks = {i["function"] for i in items
+             if i["check"] in ("leak_on_return", "leak_at_end") and i["function"] in ours}
+    # Closes et ClosesDeep liberent (CloseLog, puis CloseTwice qui la transmet), Hands confie
+    # le handle a KeepLog qui le garde. Leaks et LeaksForward ne font que l'utiliser (WriteLog
+    # emprunte), l'un avec le fopen direct d'OpenLog, l'autre via Forward. Unknown passe le
+    # handle a une fonction hors projet: comme fprintf, elle n'en prend pas la propriete.
+    assert leaks == {"Leaks", "LeaksForward", "Unknown"}
+
+
+def test_resource_summaries_describe_each_function(sample):
+    from cvi_mcp import risks
+    _append_c(sample, RESOURCE_FLOW_C)
+    engine = server._engine(server._cfg())
+    try:
+        risks.resource_check(engine)
+        summaries = engine.project.memo["resource_summaries"]
+    finally:
+        engine.close()
+    assert summaries["OpenLog"]["returns"] == {"fopen"}
+    assert summaries["Forward"]["returns"] == {"fopen"}                 # producteur transitif
+    both = {0: {"fopen", "_fdopen"}}      # toutes les prises que fclose libere
+    assert summaries["CloseLog"]["releases"] == both
+    assert summaries["CloseTwice"]["releases"] == both                  # liberation transitive
+    assert summaries["KeepLog"]["keeps"] == {0}
+    assert summaries["WriteLog"]["keeps"] == set() and not summaries["WriteLog"]["releases"]
+
+
+# ------------------------------------- le verrou qui protege une donnee --
+
+LOCK_GAP_C = """
+int gTally, gSolo;
+int lockD, lockE;
+static void TallyA(void)  { CmtGetLock(lockD); gTally++; CmtReleaseLock(lockD); }
+void TallyB(void)         { CmtGetLock(lockD); gTally = 0; CmtReleaseLock(lockD); }
+void TallyBare(void)      { gTally = 5; }                       /* oubli: lockD protege gTally */
+void SoloLocked(void)     { CmtGetLock(lockE); gSolo = 1; CmtReleaseLock(lockE); }
+void SoloBare(void)       { gSolo = 2; }                        /* un seul verrouilleur */
+int CVICALLBACK GapWorker(void *data)
+{
+    TallyA();
+    SoloLocked();
+    gSolo = 3;
+    return 0;
+}
+void StartGap(void)
+{
+    CmtScheduleThreadPoolFunction(DEFAULT_THREAD_POOL_HANDLE, GapWorker, NULL, NULL);
+}
+"""
+
+
+def test_lock_gap_needs_a_recognised_lock(sample):
+    _append_c(sample, LOCK_GAP_C)
+    _data, items = _risks()
+    gaps = {i["global"]: i for i in items if i["check"] == "lock_gap"}
+    assert set(gaps) == {"gTally"}                       # lockD pris par TallyA et TallyB
+    assert gaps["gTally"]["function"] == "TallyBare" and gaps["gTally"]["locks"] == ["lockD"]
+    assert "aucun verrou" in gaps["gTally"]["why"] and gaps["gTally"]["confidence"] == "moyenne"
+    # gSolo n'a qu'une fonction qui prend un verrou: aucune intention reconnue.
+    assert "gSolo" not in gaps
+    unlocked = {i["global"] for i in items if i["check"] == "shared_global_unlocked"}
+    assert "gSolo" in unlocked and "gTally" not in unlocked
+
+
+def test_shared_globals_report_their_usual_lock(sample):
+    _append_c(sample, LOCK_GAP_C)
+    shared = {g["global"]: g for g in call(server.threads)["shared_globals"]["items"]}
+    assert shared["gTally"]["usual_lock"] == "lockD"
+    assert shared["gTally"]["lock_gaps"][0]["function"] == "TallyBare"
+    assert shared["gTally"]["lock_gaps"][0]["held"] == []
+    assert "usual_lock" not in shared["gSolo"]
+
+
+def test_a_lock_held_by_chance_is_not_the_usual_lock(sample):
+    """Deux fonctions sur sept qui prennent un verrou en passant: il ne protege pas la donnee."""
+    bare = "".join(f"void Touch{i}(void) {{ gChance = {i}; }}\n" for i in range(4))
+    _append_c(sample, f"""
+int gChance;
+int lockZ;
+void ChanceA(void) {{ CmtGetLock(lockZ); gChance = 1; CmtReleaseLock(lockZ); }}
+void ChanceB(void) {{ CmtGetLock(lockZ); gChance = 2; CmtReleaseLock(lockZ); }}
+{bare}
+int CVICALLBACK ChanceWorker(void *data) {{ gChance = 9; return 0; }}
+void StartChance(void) {{
+    CmtScheduleThreadPoolFunction(DEFAULT_THREAD_POOL_HANDLE, ChanceWorker, NULL, NULL);
+}}
+""")
+    shared = {g["global"]: g for g in call(server.threads)["shared_globals"]["items"]}
+    assert "usual_lock" not in shared["gChance"]          # 2 fonctions sur 7 < 40 %
+    _data, items = _risks()
+    assert not [i for i in items if i["check"] == "lock_gap" and i["global"] == "gChance"]
+    assert [i for i in items if i["check"] == "shared_global_unlocked" and i["global"] == "gChance"]
+
+
+# ------------------------------------------------ impact d'un changement --
+
+IMPACT_BEFORE_C = """
+void RemovedHelper(void) { gShared = 7; }
+static void Changed(void) { gShared = 1; }
+static int SigChange(int a) { return a; }
+static void Untouched(void) { gShared = 5; }
+void CallerOne(void) { Changed(); SigChange(1); RemovedHelper(); Untouched(); }
+"""
+
+
+@pytest.fixture
+def changed(sample):
+    """Une version 'avant' enregistree, puis un projet modifie de quatre facons."""
+    worker = sample["root"] / "Src" / "worker.c"
+    head = "int CVICALLBACK Worker(void *data)\n{"
+    text = worker.read_text(encoding="utf-8")
+    worker.write_text(text.replace(head, IMPACT_BEFORE_C + head + "\n    CallerOne();"),
+                      encoding="utf-8")
+    assert "error" not in call(server.snapshot_save, label="avant")
+    text = worker.read_text(encoding="utf-8")
+    text = text.replace("static void Changed(void) { gShared = 1; }",
+                        "static void Changed(void) { gShared = 2; gShared += 3; }")  # corps modifie
+    text = text.replace("static int SigChange(int a) { return a; }",
+                        "static int SigChange(int a, int b) { return a + b; }")  # signature changee
+    text = text.replace("void RemovedHelper(void) { gShared = 7; }\n", "")  # retiree, appelee
+    worker.write_text(text + "\nvoid BrandNew(void) { Changed(); }\n", encoding="utf-8")  # ajoutee
+    config = sample["root"] / "Inc" / "config.h"
+    content = config.read_text(encoding="utf-8")
+    config.write_text(content.replace("#define COUNT 4", "#define COUNT 6"), encoding="utf-8")
+    return sample
+
+
+def test_change_impact_classifies_the_changes(changed):
+    report = call(server.change_impact, before="avant")
+    assert report["live"] is True
+    by_name = {f["name"]: f for f in report["functions"]}
+    assert set(by_name) >= {"Changed", "SigChange", "BrandNew"} and "Untouched" not in by_name
+    assert by_name["Changed"]["change"] == ["body"]
+    assert by_name["Changed"]["callers"] == ["BrandNew", "CallerOne"]
+    assert by_name["SigChange"]["change"] == ["signature"]
+    assert by_name["SigChange"]["signature_before"] != by_name["SigChange"]["signature_after"]
+    assert by_name["BrandNew"]["change"] == ["added"]
+
+
+def test_change_impact_finds_broken_calls_threads_and_macros(changed):
+    report = call(server.change_impact, before="avant")
+    assert [b["function"] for b in report["broken_calls"]] == ["RemovedHelper"]
+    assert report["broken_calls"][0]["callers"] == ["CallerOne"]
+    changed_fn = next(f for f in report["functions"] if f["name"] == "Changed")
+    # CallerOne, qui l'appelle, tourne dans le thread Worker.
+    assert changed_fn["thread_contexts"] == ["thread_pool:Worker"]
+    macro = next(m for m in report["macros"] if m["name"] == "COUNT")
+    assert (macro["before"], macro["after"]) == ("4", "6") and macro["arrays_resized"] >= 1
+    assert report["summary"]["broken_calls"] == 1 and report["summary"]["in_threads"] >= 1
+    assert "Changed" in report["review_first"] or "SigChange" in report["review_first"]
+    assert any("retiree" in line for line in report["headline"])
+
+
+def test_change_impact_without_changes_and_with_unknown_version(sample):
+    assert "error" in call(server.change_impact, before="nope")
+    call(server.snapshot_save, label="same")
+    report = call(server.change_impact, before="same")
+    assert report["functions"] == [] and report["broken_calls"] == []
+    assert report["headline"] == ["aucune difference"]
+
+
+def test_change_impact_on_a_side_by_side_version_has_no_live_data(sample, tmp_path):
+    import shutil
+    other = tmp_path / "v2"
+    shutil.copytree(sample["root"], other)
+    (other / "Src" / "worker.c").write_text(
+        (other / "Src" / "worker.c").read_text(encoding="utf-8") + "\nvoid OnlyThere(void) { }\n",
+        encoding="utf-8")
+    report = call(server.change_impact, before="current", path=str(other))
+    assert report["live"] is False
+    assert [f["name"] for f in report["functions"]] == ["OnlyThere"]
+    assert "thread_contexts" not in report["functions"][0] and "risks" not in report["functions"][0]
+
+
+# ----------------------------------------------------------- mode revue --
+
+def test_review_groups_findings_into_sections(sample):
+    _append_c(sample, DB_LEAK_C + RETURN_AND_INIT_C + LOCK_GAP_C)
+    report = call(server.review, limit=3)
+    sections = report["sections"]
+    assert list(sections) == ["crashes_and_leaks", "threads_and_locks", "ignored_errors",
+                              "consistency"]
+    crashes = sections["crashes_and_leaks"]
+    assert crashes["total"] >= 1 and crashes["by_check"].get("leak_on_return", 0) >= 1
+    assert len(crashes["items"]) <= 3
+    ranks = [(server._CONFIDENCE_RANK[i["confidence"]], i["check"]) for i in crashes["items"]]
+    assert [r[0] for r in ranks] == sorted(r[0] for r in ranks)          # confiance decroissante
+    assert "lock_gap" in sections["threads_and_locks"]["by_check"]
+    assert sections["ignored_errors"]["by_check"].get("unread_return", 0) >= 1
+    assert report["dead_code"]["functions"] >= 1 and "could_be_static" in report["not_reviewed"]
+    assert report["headline"] and report["next"]
+    assert all(s["details"] for s in sections.values())
+
+
+def test_review_respects_confidence_and_file_filters(sample):
+    _append_c(sample, RETURN_AND_INIT_C)
+    loose = call(server.review, min_confidence="faible")
+    strict = call(server.review, min_confidence="haute")
+    count = lambda r: sum(s["total"] for s in r["sections"].values())          # noqa: E731
+    assert count(strict) < count(loose) and strict["hidden_below_min_confidence"] > 0
+    only = call(server.review, min_confidence="faible", file="risky.c")
+    assert all(i["file"].endswith("risky.c") for s in only["sections"].values() for i in s["items"])
+
+
+def test_review_blocking_calls_and_consistency_have_the_common_shape():
+    from cvi_mcp import review
+    blocked = review.blocking_items([{"function": "Wait", "file": "a.c", "call": "Sleep", "line": 9,
+                                      "locks_held": ["lockA"]}])
+    assert blocked[0]["check"] == "blocking_call_under_lock" and "lockA" in blocked[0]["why"]
+    kept = review.consistency_items([
+        {"check": "could_be_static", "name": "f", "confidence": "faible"},
+        {"check": "duplicate_definition", "name": "g", "confidence": "haute",
+         "file": "a.c", "line": 1}])
+    assert [i["check"] for i in kept] == ["duplicate_definition"] and kept[0]["function"] == "g"
+    empty = review.build_review([])
+    assert empty["headline"] == ["aucun constat au seuil demande"]
+
+
+def test_risk_items_are_kept_with_the_project(sample):
+    first = call(server.risks, min_confidence="faible", limit=500)["findings"]["total"]
+    project = server._LAST["project"]
+    assert "risk_items" in str(list(project.memo))
+    assert call(server.risks, min_confidence="faible", limit=500)["findings"]["total"] == first
+    assert server._LAST["project"] is project        # rien n'a change: meme projet, meme calcul
+    _append_c(sample, DB_LEAK_C)
+    after = call(server.risks, min_confidence="faible", limit=500)["findings"]["total"]
+    assert server._LAST["project"] is not project and after > first   # fichier modifie: refait
